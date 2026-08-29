@@ -52,6 +52,7 @@ enum Command {
         command: ReportCommand,
     },
     Doctor,
+    /// Copy kbctl onto PATH. Pass --grok, --codex, or --herdr to also install agent wiring.
     Install(InstallArgs),
     #[command(name = "_herdr-open-board", hide = true)]
     HerdrOpenBoard,

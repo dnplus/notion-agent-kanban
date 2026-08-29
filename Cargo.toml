@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 description = "A Notion-backed Kanban control plane for local agents"
+repository = "https://github.com/dnplus/notion-agent-kanban"
+readme = "README.md"
 
 [dependencies]
 anyhow = "1.0"

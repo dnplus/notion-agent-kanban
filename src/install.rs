@@ -7,12 +7,10 @@ use std::{
 };
 
 pub fn run(config: Config, grok: bool, codex: bool, herdr: bool) -> Result<(), KbctlError> {
-    if !grok && !codex && !herdr {
-        return Err(KbctlError::Validation(
-            "請指定 --grok、--codex 或 --herdr".to_string(),
-        ));
-    }
     install_cli_binary()?;
+    if !grok && !codex && !herdr {
+        return Ok(());
+    }
     if grok {
         let path = grok_skill_path();
         write_atomic(&path, REPORT_SKILL)?;
@@ -348,7 +346,6 @@ In a Herdr work contract, the report is written to the project-local spool file 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
 
     #[test]
     fn grok_skill_is_written_under_grok_home() {
@@ -360,12 +357,6 @@ mod tests {
         assert!(contents.contains("kbctl report done"));
         assert!(contents.contains("KBCTL_EXECUTION_ID"));
         assert!(!path.with_file_name("SKILL.md.tmp").exists());
-    }
-
-    #[test]
-    fn install_requires_a_target() {
-        let error = run(Config::default(), false, false, false).unwrap_err();
-        assert!(error.to_string().contains("--grok"));
     }
 
     #[test]
