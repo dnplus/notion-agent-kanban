@@ -42,21 +42,7 @@ jobs:
         shell: bash
         run: |
           cp "target/${{ matrix.target }}/release/${{ matrix.exe }}" "${{ matrix.artifact }}"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.artifact }}
-          path: ${{ matrix.artifact }}
-
-  publish:
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
-        with:
-          path: dist
-          merge-multiple: true
       - uses: softprops/action-gh-release@v2
         with:
-          files: dist/*
+          files: ${{ matrix.artifact }}
           generate_release_notes: true
