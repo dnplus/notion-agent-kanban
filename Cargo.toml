@@ -1,0 +1,33 @@
+[package]
+name = "kbctl"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "A Notion-backed Kanban control plane for local agents"
+
+[dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["clock", "serde"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+crossterm = "0.28"
+dotenvy = "0.15"
+fs2 = "0.4"
+futures = "0.3"
+notionrs = "0.32"
+notionrs_types = "0.24"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+ratatui = "0.29"
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+thiserror = "2.0"
+tokio = { version = "1.45", features = ["full"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1.17", features = ["v4", "serde"] }
+
+[dev-dependencies]
+tempfile = "3.20"
