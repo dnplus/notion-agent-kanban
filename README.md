@@ -10,19 +10,13 @@
 export NOTION_API_TOKEN=ntn_...
 ```
 
-不指定 `--tasks` 時，`kbctl init` 會用 Notion workspace-level parent 建立 Tasks、Projects、預設 Project 與 Agent Board。對支援 workspace-level PAT 的連線，這些內容會出現在 Notion 的 Private 區域：
+`kbctl init` 一律建立全新的 Tasks、Projects、預設 Project 與 Agent Board。不指定 `--parent` 時用 Notion workspace-level parent，對支援 workspace-level PAT 的連線會出現在 Private 區域。之後把這些 database 搬到哪個 workspace 都不必重跑 init；kbctl 用設定裡的 database id 存取，只要目前的 Notion token 仍能打到它們即可。
 
 ```sh
 kbctl init
 ```
 
-若要把既有資料庫接進來：
-
-```sh
-kbctl init --tasks <database-id-or-url> --projects <database-id-or-url>
-```
-
-`--parent <page-id-or-url>` 只在希望把新資料庫放到指定頁面底下時使用；不指定時不會猜測任何名稱相似的「個人專案」頁面。
+`--parent <page-id-or-url>` 只決定**第一次建立**時放在哪個頁面底下。
 
 ## 工作流程
 

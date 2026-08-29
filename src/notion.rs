@@ -667,9 +667,6 @@ impl KanbanProvider for NotionProvider {
     }
 
     async fn schema_is_current(&self) -> Result<(), KbctlError> {
-        let Some(expected) = self.config.mapping.schema_fingerprint.as_deref() else {
-            return Ok(());
-        };
         let tasks_id = self
             .config
             .notion
@@ -681,17 +678,22 @@ impl KanbanProvider for NotionProvider {
                 )
             })?;
         let tasks = self.retrieve_schema(tasks_id).await?;
-        let current =
-            if let Some(projects_id) = self.config.notion.projects_data_source_id.as_deref() {
-                let projects = self.retrieve_schema(projects_id).await?;
-                schema_pair_fingerprint(&tasks, &projects)
-            } else {
-                tasks.fingerprint.clone()
-            };
-        if current != expected {
-            return Err(KbctlError::Validation(
-                "Notion schema drift detected; rerun kbctl init to confirm the mapping".to_string(),
-            ));
+        missing_required_property(&tasks.properties, REQUIRED_TASK_PROPERTIES).map_err(
+            |property| {
+                KbctlError::Validation(format!(
+                    "Tasks database is missing required property {property}"
+                ))
+            },
+        )?;
+        if let Some(projects_id) = self.config.notion.projects_data_source_id.as_deref() {
+            let projects = self.retrieve_schema(projects_id).await?;
+            missing_required_property(&projects.properties, REQUIRED_PROJECT_PROPERTIES).map_err(
+                |property| {
+                    KbctlError::Validation(format!(
+                        "Projects database is missing required property {property}"
+                    ))
+                },
+            )?;
         }
         Ok(())
     }
@@ -701,7 +703,7 @@ pub async fn list_projects(provider: &NotionProvider) -> Result<Vec<Project>, Kb
     provider.query_projects().await
 }
 
-pub fn default_mapping() -> MappingConfig {
+fn default_mapping() -> MappingConfig {
     MappingConfig {
         tasks: PropertyMapping {
             name: Some("Name".to_string()),
@@ -923,6 +925,32 @@ fn rich_text_plain(items: &[Value]) -> String {
         .join("")
 }
 
+const REQUIRED_TASK_PROPERTIES: &[&str] = &[
+    "Name",
+    "Status",
+    "Project",
+    "Agent",
+    "Scheduled At",
+    "Due",
+    "Execution ID",
+    "Result",
+];
+const REQUIRED_PROJECT_PROPERTIES: &[&str] =
+    &["Name", "Path", "Default Agent", "Active", "Last Activity"];
+
+fn missing_required_property(properties: &Value, required: &[&str]) -> Result<(), String> {
+    let Some(map) = properties.as_object() else {
+        return Err("properties".to_string());
+    };
+    for property in required {
+        let present = map.keys().any(|name| name.eq_ignore_ascii_case(property));
+        if !present {
+            return Err((*property).to_string());
+        }
+    }
+    Ok(())
+}
+
 fn fingerprint(value: &Value) -> String {
     let mut digest = Sha256::new();
     digest.update(value.to_string().as_bytes());
@@ -940,11 +968,7 @@ fn mapping_from_schemas(tasks: &SchemaSnapshot, projects: &SchemaSnapshot) -> Ma
     mapping
 }
 
-pub fn schema_pair_fingerprint(tasks: &SchemaSnapshot, projects: &SchemaSnapshot) -> String {
-    fingerprint(&json!({"tasks": tasks.fingerprint, "projects": projects.fingerprint}))
-}
-
-pub fn status_options_from_schema(schema: &SchemaSnapshot) -> BTreeMap<String, String> {
+fn status_options_from_schema(schema: &SchemaSnapshot) -> BTreeMap<String, String> {
     let Some(properties) = schema.properties.as_object() else {
         return BTreeMap::new();
     };
@@ -1205,6 +1229,28 @@ mod tests {
         assert_eq!(
             payload["parent"],
             json!({"type": "page_id", "page_id": "page-id"})
+        );
+    }
+
+    #[test]
+    fn owned_schema_accepts_extra_properties() {
+        let mut properties =
+            serde_json::to_value(task_schema("project-data-source").unwrap()).unwrap();
+        properties.as_object_mut().unwrap().insert(
+            "Notes".to_string(),
+            json!({"type": "rich_text", "rich_text": {}}),
+        );
+        assert!(missing_required_property(&properties, REQUIRED_TASK_PROPERTIES).is_ok());
+    }
+
+    #[test]
+    fn owned_schema_rejects_missing_required_property() {
+        let mut properties =
+            serde_json::to_value(task_schema("project-data-source").unwrap()).unwrap();
+        properties.as_object_mut().unwrap().remove("Status");
+        assert_eq!(
+            missing_required_property(&properties, REQUIRED_TASK_PROPERTIES).unwrap_err(),
+            "Status"
         );
     }
 }

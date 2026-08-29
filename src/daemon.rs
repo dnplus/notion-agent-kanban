@@ -85,7 +85,7 @@ impl Daemon {
         };
         summary.reconciled = reconciled_tasks.len();
         if let Err(error) = self.provider.schema_is_current().await {
-            tracing::warn!(error = %error, "schema drift blocks new dispatch");
+            tracing::warn!(error = %error, "schema check blocks new dispatch");
             return Err(error);
         }
         let tasks = self.provider.list_tasks().await?;

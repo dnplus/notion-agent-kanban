@@ -5,7 +5,7 @@ use crate::{
     error::KbctlError,
     herdr::{AgentRuntime, HerdrRuntime},
     install,
-    notion::{DatabaseTarget, KanbanProvider, NotionProvider, TaskUpdate, default_mapping},
+    notion::{KanbanProvider, NotionProvider, TaskUpdate},
     report_spool,
     store::Store,
     tui,
@@ -14,7 +14,6 @@ use anyhow::Result;
 use chrono::Utc;
 use clap::{Args, Parser, Subcommand};
 use std::{
-    io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -60,16 +59,10 @@ enum Command {
 
 #[derive(Debug, Args)]
 struct InitArgs {
-    #[arg(long, value_name = "ID_OR_URL")]
-    tasks: Option<String>,
-    #[arg(long, value_name = "ID_OR_URL")]
-    projects: Option<String>,
     #[arg(long, value_name = "PAGE_ID_OR_URL", env = "NOTION_PARENT_PAGE_ID")]
     parent: Option<String>,
     #[arg(long, value_name = "DIRECTORY")]
     project_path: Option<PathBuf>,
-    #[arg(long)]
-    yes: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -163,56 +156,13 @@ pub async fn run() -> Result<()> {
 }
 
 async fn init(mut config: Config, config_path: Option<&Path>, args: InitArgs) -> Result<()> {
-    let provider = NotionProvider::new(config.clone())?;
-    if let Some(tasks_input) = args.tasks {
-        let tasks_id = normalize_notion_id(&tasks_input)?;
-        let task_schema = provider
-            .discover_schema(DatabaseTarget::Database(tasks_id.clone()))
-            .await?;
-        let projects_schema = if let Some(projects_input) = args.projects {
-            Some(
-                provider
-                    .discover_schema(DatabaseTarget::Database(normalize_notion_id(
-                        &projects_input,
-                    )?))
-                    .await?,
-            )
-        } else if let Some(projects_id) = config.notion.projects_database_id.clone() {
-            Some(
-                provider
-                    .discover_schema(DatabaseTarget::Database(projects_id))
-                    .await?,
-            )
-        } else {
-            None
-        };
-        validate_existing_schema(&task_schema, projects_schema.as_ref())?;
-        let mapping = existing_mapping(&task_schema, projects_schema.as_ref());
-        if !args.yes && !confirm("確認使用這組欄位 mapping？[y/N] ")? {
-            return Err(
-                KbctlError::Validation("mapping confirmation cancelled".to_string()).into(),
-            );
-        }
-        config.notion.tasks_database_id =
-            Some(task_schema.database_id.clone().if_empty_then(tasks_id));
-        config.notion.tasks_data_source_id = task_schema.data_source_id.clone();
-        config.mapping = mapping;
-        if let Some(projects_schema) = projects_schema {
-            config.notion.projects_database_id = Some(projects_schema.database_id);
-            config.notion.projects_data_source_id = projects_schema.data_source_id;
-        }
-        configure_implicit_project(&mut config, args.project_path)?;
-        let path = config.save(config_path)?;
-        println!("已保存既有 Notion database mapping：{}", path.display());
-        return Ok(());
-    }
-
     if config.notion.tasks_database_id.is_some() {
         println!(
-            "kbctl 已初始化；使用 --tasks 重新確認既有 mapping。還原或重建請先移除本機設定中的 database ID。"
+            "kbctl 已初始化。資料庫之後搬到哪個 workspace 都不必重跑 init，只要目前的 Notion token 仍能存取同一組 database。若要重建，先從設定檔移除 database ID。"
         );
         return Ok(());
     }
+    let provider = NotionProvider::new(config.clone())?;
     let parent_id = args
         .parent
         .or(config.notion.parent_page_id.clone())
@@ -432,9 +382,9 @@ async fn doctor(config: Config) -> Result<()> {
         println!("WARN Tasks database 尚未設定；請先執行 kbctl init");
     }
     if let Err(error) = provider.schema_is_current().await {
-        println!("FAIL schema mapping: {error}");
+        println!("FAIL schema: {error}");
     } else {
-        println!("PASS schema mapping");
+        println!("PASS schema");
     }
     for binding in config
         .project
@@ -454,123 +404,6 @@ async fn doctor(config: Config) -> Result<()> {
         Err(error) => println!("FAIL Herdr: {error}"),
     }
     Ok(())
-}
-
-fn configure_implicit_project(
-    config: &mut Config,
-    path: Option<PathBuf>,
-) -> Result<(), KbctlError> {
-    let path = match path {
-        Some(path) => canonical_directory(&path)?,
-        None => std::env::current_dir()
-            .map_err(|error| KbctlError::Config(error.to_string()))?
-            .display()
-            .to_string(),
-    };
-    if config.project.default.is_none() {
-        config.project.default = Some(LocalProjectBinding {
-            id: "__implicit__".to_string(),
-            name: "Implicit Project".to_string(),
-            path,
-            default_agent: "codex".to_string(),
-            active: true,
-        });
-    }
-    Ok(())
-}
-
-fn validate_existing_schema(
-    tasks: &crate::domain::SchemaSnapshot,
-    projects: Option<&crate::domain::SchemaSnapshot>,
-) -> Result<(), KbctlError> {
-    let properties = tasks
-        .properties
-        .as_object()
-        .ok_or_else(|| KbctlError::Validation("Tasks schema 沒有 properties".to_string()))?;
-    let has_name = properties
-        .keys()
-        .any(|name| name.eq_ignore_ascii_case("name") || name.eq_ignore_ascii_case("title"));
-    let has_status = properties
-        .keys()
-        .any(|name| name.eq_ignore_ascii_case("status") || name.eq_ignore_ascii_case("state"));
-    if !has_name || !has_status {
-        return Err(KbctlError::Validation(
-            "既有 Tasks database 至少必須有 Name/Title 與 Status/State 欄位".to_string(),
-        ));
-    }
-    if let Some(projects) = projects {
-        let properties = projects
-            .properties
-            .as_object()
-            .ok_or_else(|| KbctlError::Validation("Projects schema 沒有 properties".to_string()))?;
-        if !properties
-            .keys()
-            .any(|name| name.eq_ignore_ascii_case("name") || name.eq_ignore_ascii_case("title"))
-        {
-            return Err(KbctlError::Validation(
-                "Projects database 至少必須有 Name/Title 欄位".to_string(),
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn existing_mapping(
-    tasks: &crate::domain::SchemaSnapshot,
-    projects: Option<&crate::domain::SchemaSnapshot>,
-) -> crate::config::MappingConfig {
-    let mut mapping = default_mapping();
-    mapping.tasks = map_properties(&tasks.properties, mapping.tasks);
-    let status_options = crate::notion::status_options_from_schema(tasks);
-    if !status_options.is_empty() {
-        mapping.status_options = status_options;
-    }
-    if let Some(projects) = projects {
-        mapping.projects = map_properties(&projects.properties, mapping.projects);
-        mapping.schema_fingerprint = Some(crate::notion::schema_pair_fingerprint(tasks, projects));
-    } else {
-        mapping.schema_fingerprint = Some(tasks.fingerprint.clone());
-    }
-    mapping
-}
-
-fn map_properties(
-    properties: &serde_json::Value,
-    mut mapping: crate::config::PropertyMapping,
-) -> crate::config::PropertyMapping {
-    let Some(map) = properties.as_object() else {
-        return mapping;
-    };
-    let find = |aliases: &[&str]| {
-        aliases
-            .iter()
-            .find_map(|alias| {
-                map.get(*alias)
-                    .and_then(|value| value.get("id"))
-                    .and_then(serde_json::Value::as_str)
-                    .map(ToOwned::to_owned)
-            })
-            .or_else(|| {
-                map.iter()
-                    .find(|(name, _)| aliases.iter().any(|alias| name.eq_ignore_ascii_case(alias)))
-                    .and_then(|(_, value)| value.get("id"))
-                    .and_then(serde_json::Value::as_str)
-                    .map(ToOwned::to_owned)
-            })
-    };
-    mapping.name = find(&["Name", "Title"]).or(mapping.name);
-    mapping.status = find(&["Status", "State"]).or(mapping.status);
-    mapping.project = find(&["Project", "Projects"]).or(mapping.project);
-    mapping.agent = find(&["Agent"]).or(mapping.agent);
-    mapping.scheduled_at = find(&["Scheduled At", "Schedule At"]).or(mapping.scheduled_at);
-    mapping.due = find(&["Due", "Due Date", "Deadline"]).or(mapping.due);
-    mapping.execution_id = find(&["Execution ID", "Execution"]).or(mapping.execution_id);
-    mapping.result = find(&["Result", "Outcome"]).or(mapping.result);
-    mapping.path = find(&["Path"]).or(mapping.path);
-    mapping.default_agent = find(&["Default Agent"]).or(mapping.default_agent);
-    mapping.active = find(&["Active"]).or(mapping.active);
-    mapping.last_activity = find(&["Last Activity"]).or(mapping.last_activity);
-    mapping
 }
 
 fn render_report(report: &Report, result_file: Option<&str>) -> String {
@@ -635,37 +468,5 @@ fn normalize_notion_id(value: &str) -> Result<String, KbctlError> {
         Ok(trimmed.to_string())
     } else {
         Err(KbctlError::Validation("Notion ID 不可為空".to_string()))
-    }
-}
-
-fn confirm(prompt: &str) -> Result<bool, KbctlError> {
-    if !io::stdin().is_terminal() {
-        return Ok(true);
-    }
-    print!("{prompt}");
-    io::stdout()
-        .flush()
-        .map_err(|error| KbctlError::Config(error.to_string()))?;
-    let mut input = String::new();
-    io::stdin()
-        .read_line(&mut input)
-        .map_err(|error| KbctlError::Config(error.to_string()))?;
-    Ok(matches!(
-        input.trim().to_ascii_lowercase().as_str(),
-        "y" | "yes"
-    ))
-}
-
-trait EmptyFallback {
-    fn if_empty_then(self, fallback: String) -> String;
-}
-
-impl EmptyFallback for String {
-    fn if_empty_then(self, fallback: String) -> String {
-        if self.trim().is_empty() {
-            fallback
-        } else {
-            self
-        }
     }
 }
