@@ -12,6 +12,7 @@ pub fn run(config: Config, grok: bool, codex: bool, herdr: bool) -> Result<(), K
             "請指定 --grok、--codex 或 --herdr".to_string(),
         ));
     }
+    install_cli_binary()?;
     if grok {
         let path = grok_skill_path();
         write_atomic(&path, REPORT_SKILL)?;
@@ -235,6 +236,45 @@ fn run_herdr_json(binary: &str, args: &[&str]) -> Result<Value, KbctlError> {
     Ok(value)
 }
 
+fn install_cli_binary() -> Result<(), KbctlError> {
+    let executable = env::current_exe()
+        .map_err(|error| KbctlError::Runtime(format!("找不到 kbctl executable: {error}")))?;
+    let dest = cli_binary_path();
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| KbctlError::Config(format!("create {}: {error}", parent.display())))?;
+    }
+    if same_path(&executable, &dest) {
+        println!("kbctl 已在 PATH：{}", dest.display());
+        return Ok(());
+    }
+    fs::copy(&executable, &dest)
+        .map_err(|error| KbctlError::Config(format!("install {}: {error}", dest.display())))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(&dest)
+            .map_err(|error| KbctlError::Config(format!("stat {}: {error}", dest.display())))?
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&dest, permissions)
+            .map_err(|error| KbctlError::Config(format!("chmod {}: {error}", dest.display())))?;
+    }
+    println!("kbctl 已安裝到 PATH：{}", dest.display());
+    Ok(())
+}
+
+fn cli_binary_path() -> PathBuf {
+    home_dir().join(".local/bin/kbctl")
+}
+
+fn same_path(left: &Path, right: &Path) -> bool {
+    match (fs::canonicalize(left), fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
+}
+
 fn grok_skill_path() -> PathBuf {
     grok_skill_path_from(&grok_home())
 }
@@ -326,5 +366,10 @@ mod tests {
     fn install_requires_a_target() {
         let error = run(Config::default(), false, false, false).unwrap_err();
         assert!(error.to_string().contains("--grok"));
+    }
+
+    #[test]
+    fn cli_binary_installs_under_local_bin() {
+        assert!(cli_binary_path().ends_with(".local/bin/kbctl"));
     }
 }
