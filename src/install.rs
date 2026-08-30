@@ -66,18 +66,22 @@ fn install_cli_binary() -> Result<(), KbctlError> {
         println!("kbctl 已在 PATH：{}", dest.display());
         return Ok(());
     }
-    fs::copy(&executable, &dest)
-        .map_err(|error| KbctlError::Config(format!("install {}: {error}", dest.display())))?;
+    let temporary = dest.with_file_name(".kbctl.installing");
+    fs::copy(&executable, &temporary)
+        .map_err(|error| KbctlError::Config(format!("install {}: {error}", temporary.display())))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut permissions = fs::metadata(&dest)
-            .map_err(|error| KbctlError::Config(format!("stat {}: {error}", dest.display())))?
+        let mut permissions = fs::metadata(&temporary)
+            .map_err(|error| KbctlError::Config(format!("stat {}: {error}", temporary.display())))?
             .permissions();
         permissions.set_mode(0o755);
-        fs::set_permissions(&dest, permissions)
-            .map_err(|error| KbctlError::Config(format!("chmod {}: {error}", dest.display())))?;
+        fs::set_permissions(&temporary, permissions).map_err(|error| {
+            KbctlError::Config(format!("chmod {}: {error}", temporary.display()))
+        })?;
     }
+    fs::rename(&temporary, &dest)
+        .map_err(|error| KbctlError::Config(format!("activate {}: {error}", dest.display())))?;
     println!("kbctl 已安裝到 PATH：{}", dest.display());
     Ok(())
 }
