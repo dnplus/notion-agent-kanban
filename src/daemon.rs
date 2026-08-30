@@ -771,15 +771,13 @@ impl Daemon {
                     ),
                 )
                 .await?;
-            if let Some(project_id) = task.project_id.clone() {
-                self.provider
-                    .update_project(ProjectUpdate {
-                        id: project_id,
-                        last_activity: Some(run.updated_at),
-                        ..Default::default()
-                    })
-                    .await?;
-            }
+            self.provider
+                .update_project(ProjectUpdate {
+                    id: self.binding_for(task)?.id,
+                    last_activity: Some(run.updated_at),
+                    ..Default::default()
+                })
+                .await?;
             self.provider
                 .update_task(TaskUpdate {
                     id: task.id.clone(),
@@ -1212,15 +1210,13 @@ impl Daemon {
         self.provider
             .append_result(&task.id, &pending.result_text)
             .await?;
-        if let Some(project_id) = task.project_id.clone() {
-            self.provider
-                .update_project(ProjectUpdate {
-                    id: project_id,
-                    last_activity: Some(Utc::now()),
-                    ..Default::default()
-                })
-                .await?;
-        }
+        self.provider
+            .update_project(ProjectUpdate {
+                id: self.binding_for(&task)?.id,
+                last_activity: Some(Utc::now()),
+                ..Default::default()
+            })
+            .await?;
         self.provider
             .update_task(TaskUpdate {
                 id: task.id.clone(),
@@ -1677,11 +1673,10 @@ mod tests {
     #[tokio::test]
     async fn final_parent_review_summary_is_written_to_notion_result() {
         let directory = tempfile::tempdir().unwrap();
-        let mut parent = task(
+        let parent = task(
             TaskStatus::Running,
             Some(Utc::now() + ChronoDuration::hours(1)),
         );
-        parent.project_id = Some("project-1".to_string());
         let inner = FakeProvider {
             tasks: Arc::new(Mutex::new(vec![parent])),
             appended: Arc::new(Mutex::new(Vec::new())),
@@ -1753,7 +1748,7 @@ mod tests {
         assert_eq!(inner.appended.lock().unwrap().len(), 1);
         assert!(inner.appended.lock().unwrap()[0].starts_with("kbctl-orchestration:task-1:v1\n"));
         assert_eq!(updates.lock().unwrap().len(), 1);
-        assert_eq!(updates.lock().unwrap()[0].id, "project-1");
+        assert_eq!(updates.lock().unwrap()[0].id, "__implicit__");
     }
 
     #[tokio::test]
