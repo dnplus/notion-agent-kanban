@@ -1,4 +1,7 @@
-use crate::{domain::ExecutionRole, error::KbctlError};
+use crate::{
+    domain::{AvailableAgentProfile, ExecutionRole},
+    error::KbctlError,
+};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -288,6 +291,20 @@ impl Config {
                 ..AgentProfile::default()
             })
         })
+    }
+
+    pub fn worker_profiles(&self) -> Vec<AvailableAgentProfile> {
+        self.profiles
+            .iter()
+            .filter(|(_, profile)| profile.role == ExecutionRole::Worker)
+            .map(|(name, profile)| AvailableAgentProfile {
+                name: name.clone(),
+                kind: profile.kind.clone(),
+                model: profile.model.clone(),
+                reasoning: profile.reasoning.clone(),
+                agent: profile.agent.clone(),
+            })
+            .collect()
     }
 }
 

@@ -595,6 +595,38 @@ impl Store {
         Ok(inserted == 1)
     }
 
+    pub fn runtime_group(
+        &self,
+        project_id: &str,
+        runtime_kind: &str,
+    ) -> Result<Option<String>, KbctlError> {
+        let connection = self.connection()?;
+        connection
+            .query_row(
+                "SELECT group_id FROM runtime_groups WHERE project_id = ?1 AND runtime_kind = ?2",
+                params![project_id, runtime_kind],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| KbctlError::State(error.to_string()))
+    }
+
+    pub fn save_runtime_group(
+        &self,
+        project_id: &str,
+        runtime_kind: &str,
+        group_id: &str,
+    ) -> Result<(), KbctlError> {
+        let connection = self.connection()?;
+        connection
+            .execute(
+                "INSERT INTO runtime_groups (project_id, runtime_kind, group_id, updated_at) VALUES (?1, ?2, ?3, CURRENT_TIMESTAMP) ON CONFLICT(project_id, runtime_kind) DO UPDATE SET group_id=excluded.group_id, updated_at=CURRENT_TIMESTAMP",
+                params![project_id, runtime_kind, group_id],
+            )
+            .map_err(|error| KbctlError::State(error.to_string()))?;
+        Ok(())
+    }
+
     fn read_json<T: serde::de::DeserializeOwned>(
         &self,
         query: &str,
@@ -683,7 +715,14 @@ impl Store {
                      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                      PRIMARY KEY (source, event_id)
                  );
-                 PRAGMA user_version = 2;",
+                 CREATE TABLE IF NOT EXISTS runtime_groups (
+                     project_id TEXT NOT NULL,
+                     runtime_kind TEXT NOT NULL,
+                     group_id TEXT NOT NULL,
+                     updated_at TEXT NOT NULL,
+                     PRIMARY KEY (project_id, runtime_kind)
+                 );
+                 PRAGMA user_version = 3;",
             )
             .map_err(|error| KbctlError::State(error.to_string()))?;
         let mut columns = connection
@@ -843,6 +882,27 @@ mod tests {
             !store
                 .record_runtime_event("herdr", "event-1", &payload)
                 .unwrap()
+        );
+    }
+
+    #[test]
+    fn runtime_group_is_persisted_per_project_and_runtime() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path().join("state.db")).unwrap();
+        assert_eq!(store.runtime_group("project-1", "herdr").unwrap(), None);
+        store
+            .save_runtime_group("project-1", "herdr", "w1")
+            .unwrap();
+        assert_eq!(
+            store.runtime_group("project-1", "herdr").unwrap(),
+            Some("w1".to_string())
+        );
+        store
+            .save_runtime_group("project-1", "herdr", "w2")
+            .unwrap();
+        assert_eq!(
+            store.runtime_group("project-1", "herdr").unwrap(),
+            Some("w2".to_string())
         );
     }
 }

@@ -390,6 +390,15 @@ pub struct Project {
     pub last_activity: Option<DateTime<Utc>>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AvailableAgentProfile {
+    pub name: String,
+    pub kind: String,
+    pub model: Option<String>,
+    pub reasoning: Option<String>,
+    pub agent: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkContract {
     pub task_id: String,
@@ -412,13 +421,15 @@ pub struct WorkContract {
     pub work_item_id: Option<String>,
     pub submission_path: String,
     pub report_command: String,
+    pub runtime_group_id: Option<String>,
+    pub available_worker_profiles: Vec<AvailableAgentProfile>,
 }
 
 impl WorkContract {
     pub fn prompt(&self) -> String {
         let report = match self.role {
             ExecutionRole::Supervisor => {
-                "這是新一輪 triage，不是 review。無論正文是否包含舊 execution、舊回報或歷史結論，本輪只能回傳 Plan envelope，禁止回傳 Review envelope。若需求不足，Plan 仍須建立一個 low-risk read step，用來整理缺漏與產生可供人工補充的問題。Plan 格式為 {\"type\":\"plan\",\"plan\":{\"parent_task_id\":\"...\",\"version\":1,\"summary\":\"...\",\"steps\":[{\"id\":\"step-1\",\"title\":\"...\",\"objective\":\"...\",\"depends_on\":[],\"profile\":\"fast_worker\",\"risk\":\"low\",\"mode\":\"read\",\"write_scope\":[],\"acceptance\":[\"...\"]}]}}。不要直接啟動 Worker、修改專案或改 Notion 狀態。"
+                "這是新一輪 triage，不是 review。請自行判斷是否需要拆工、依賴關係與最合適的 Worker profile；不要為了使用多 Agent 而刻意拆分。無論正文是否包含舊 execution、舊回報或歷史結論，本輪只能回傳 Plan envelope，禁止回傳 Review envelope。若需求不足，Plan 仍須建立一個 low-risk read step，用來整理缺漏與產生可供人工補充的問題。Plan 格式為 {\"type\":\"plan\",\"plan\":{\"parent_task_id\":\"...\",\"version\":1,\"summary\":\"...\",\"steps\":[{\"id\":\"step-1\",\"title\":\"...\",\"objective\":\"...\",\"depends_on\":[],\"profile\":\"<available-worker-profile>\",\"risk\":\"low\",\"mode\":\"read\",\"write_scope\":[],\"acceptance\":[\"...\"]}]}}。不要直接啟動 Worker、修改專案或改 Notion 狀態。"
             }
             ExecutionRole::Reviewer => {
                 "這是明確指定 target 的 review 回合，本輪只能回傳 Review envelope，禁止回傳 Plan envelope。Review 格式為 {\"type\":\"review\",\"review\":{\"target_id\":\"...\",\"decision\":\"accept\",\"summary\":\"...\",\"review_round\":1,\"findings\":[]}}。不要直接啟動 Worker、修改專案或改 Notion 狀態。"
@@ -435,8 +446,28 @@ impl WorkContract {
                 }
             },
         };
+        let profiles = if self.role == ExecutionRole::Supervisor {
+            let values = self
+                .available_worker_profiles
+                .iter()
+                .map(|profile| {
+                    format!(
+                        "- {}: kind={}, model={}, reasoning={}, agent={}",
+                        profile.name,
+                        profile.kind,
+                        profile.model.as_deref().unwrap_or("default"),
+                        profile.reasoning.as_deref().unwrap_or("default"),
+                        profile.agent.as_deref().unwrap_or("default")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("\nAvailable worker profiles:\n{values}\n")
+        } else {
+            String::new()
+        };
         format!(
-            "你正在處理 kbctl work contract。\nTask ID: {}\nExecution ID: {}\nRole: {:?}\nPlan version: {}\nWork item: {}\nMode: {}\nTitle: {}\nProject: {}\nWorking directory: {}\nDue: {}\nScheduled at: {}\n\n需求正文：\n{}\n\n{}\n{}\n不要自行把 Notion Task 標成 done；business status 由 kbctl 驗證後寫回。",
+            "你正在處理 kbctl work contract。\nTask ID: {}\nExecution ID: {}\nRole: {:?}\nPlan version: {}\nWork item: {}\nMode: {}\nTitle: {}\nProject: {}\nWorking directory: {}\nDue: {}\nScheduled at: {}\n{}\n需求正文：\n{}\n\n{}\n{}\n不要自行把 Notion Task 標成 done；business status 由 kbctl 驗證後寫回。",
             self.task_id,
             self.execution_id,
             self.role,
@@ -454,6 +485,7 @@ impl WorkContract {
             self.scheduled_at
                 .map(|value| value.to_rfc3339())
                 .unwrap_or_else(|| "none".to_string()),
+            profiles,
             self.body,
             report,
             if self.role == ExecutionRole::Standalone {
@@ -579,6 +611,55 @@ mod orchestration_tests {
             steps: vec![item],
         };
         assert!(plan.validate(8).unwrap_err().contains("write_scope"));
+    }
+
+    #[test]
+    fn supervisor_prompt_exposes_profiles_without_prescribing_one() {
+        let contract = WorkContract {
+            task_id: "task-1".to_string(),
+            execution_id: "exec-1".to_string(),
+            mode: ExecutionMode::Triage,
+            title: "研究技術選型".to_string(),
+            body: "比較三項方案".to_string(),
+            project_name: "kbctl".to_string(),
+            project_path: "/tmp/kbctl".to_string(),
+            due: None,
+            scheduled_at: None,
+            agent_kind: "codex".to_string(),
+            profile_name: "supervisor".to_string(),
+            role: ExecutionRole::Supervisor,
+            model: Some("gpt-5.6-sol".to_string()),
+            reasoning: Some("high".to_string()),
+            agent: None,
+            read_only: true,
+            plan_version: Some(1),
+            work_item_id: None,
+            submission_path: "/tmp/submission.json".to_string(),
+            report_command: "kbctl report submit".to_string(),
+            runtime_group_id: None,
+            available_worker_profiles: vec![
+                AvailableAgentProfile {
+                    name: "fast_worker".to_string(),
+                    kind: "codex".to_string(),
+                    model: Some("gpt-5.6-luna".to_string()),
+                    reasoning: Some("high".to_string()),
+                    agent: None,
+                },
+                AvailableAgentProfile {
+                    name: "grok_worker".to_string(),
+                    kind: "grok".to_string(),
+                    model: None,
+                    reasoning: None,
+                    agent: None,
+                },
+            ],
+        };
+        let prompt = contract.prompt();
+        assert!(prompt.contains("請自行判斷是否需要拆工"));
+        assert!(prompt.contains("profile\":\"<available-worker-profile>"));
+        assert!(prompt.contains("fast_worker: kind=codex"));
+        assert!(prompt.contains("grok_worker: kind=grok"));
+        assert!(!prompt.contains("profile\":\"fast_worker"));
     }
 }
 

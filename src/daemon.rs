@@ -316,6 +316,14 @@ impl Daemon {
                 "kbctl report <done|blocked|review> --execution {}",
                 execution.id
             ),
+            runtime_group_id: self
+                .store
+                .runtime_group(&binding.id, self.runtime.runtime_kind())?,
+            available_worker_profiles: if execution.role == ExecutionRole::Supervisor {
+                self.config.worker_profiles()
+            } else {
+                Vec::new()
+            },
         };
         let runtime_id = match self.runtime.ensure(&execution, &contract).await {
             Ok(value) => value,
@@ -350,6 +358,7 @@ impl Daemon {
             }
         };
         self.store.set_runtime_id(&execution.id, &runtime_id)?;
+        self.remember_runtime_group(&binding.id, &runtime_id)?;
         Ok(())
     }
 
@@ -991,7 +1000,7 @@ impl Daemon {
             mode: ExecutionMode::Execute,
             title: item.step.title.clone(),
             body,
-            project_name: binding.name,
+            project_name: binding.name.clone(),
             project_path: checkout_path,
             due: task.due,
             scheduled_at: task.scheduled_at,
@@ -1009,9 +1018,14 @@ impl Daemon {
                 "kbctl report submit --execution {} --manifest <file>",
                 execution.id
             ),
+            runtime_group_id: self
+                .store
+                .runtime_group(&binding.id, self.runtime.runtime_kind())?,
+            available_worker_profiles: Vec::new(),
         };
         let runtime_id = self.runtime.ensure(&execution, &contract).await?;
         self.store.set_runtime_id(&execution.id, &runtime_id)?;
+        self.remember_runtime_group(&binding.id, &runtime_id)?;
         item.state = WorkItemState::Running;
         item.execution_id = Some(execution.id);
         item.branch = branch;
@@ -1249,6 +1263,14 @@ impl Daemon {
             .ok_or_else(|| {
                 KbctlError::Validation(format!("task {} has no local Project binding", task.id))
             })
+    }
+
+    fn remember_runtime_group(&self, project_id: &str, runtime_id: &str) -> Result<(), KbctlError> {
+        if let Some(group_id) = self.runtime.runtime_group_id(runtime_id)? {
+            self.store
+                .save_runtime_group(project_id, self.runtime.runtime_kind(), &group_id)?;
+        }
+        Ok(())
     }
 }
 

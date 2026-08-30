@@ -57,6 +57,13 @@ pub(crate) struct BoardPaneContext<'a> {
 
 #[async_trait]
 pub trait AgentRuntime: Send + Sync {
+    fn runtime_kind(&self) -> &'static str {
+        "runtime"
+    }
+    fn runtime_group_id(&self, runtime_id: &str) -> Result<Option<String>, KbctlError> {
+        let _ = runtime_id;
+        Ok(None)
+    }
     async fn ensure(
         &self,
         execution: &Execution,
@@ -312,47 +319,45 @@ impl HerdrRuntime {
 
 #[async_trait]
 impl AgentRuntime for HerdrRuntime {
+    fn runtime_kind(&self) -> &'static str {
+        "herdr"
+    }
+
+    fn runtime_group_id(&self, runtime_id: &str) -> Result<Option<String>, KbctlError> {
+        let runtime: RuntimeExecution = serde_json::from_str(runtime_id)
+            .map_err(|error| KbctlError::Runtime(format!("invalid Herdr runtime id: {error}")))?;
+        Ok(Some(runtime.workspace_id))
+    }
+
     async fn start(
         &self,
         execution: &Execution,
         contract: &WorkContract,
     ) -> Result<String, KbctlError> {
         let agent_name = display_agent_name(&contract.agent_kind, &contract.title, &execution.id);
-        let mut workspace_args = vec![
-            "workspace".to_string(),
-            "create".to_string(),
-            "--cwd".to_string(),
-            contract.project_path.clone(),
-            "--label".to_string(),
-            format!("{} · {}", contract.project_name, contract.title),
-            "--no-focus".to_string(),
-            "--env".to_string(),
-            format!("KBCTL_EXECUTION_ID={}", execution.id),
-            "--env".to_string(),
-            format!("KBCTL_TASK_ID={}", execution.task_id),
-            "--env".to_string(),
-            format!(
-                "{}={}",
-                report_spool::REPORT_FILE_ENV,
-                report_spool::path_for(std::path::Path::new(&contract.project_path), &execution.id)
-                    .display()
-            ),
-            "--env".to_string(),
-            format!("KBCTL_EXECUTION_MODE={}", execution.mode),
-            "--env".to_string(),
-            format!("KBCTL_EXECUTION_ROLE={:?}", execution.role).to_ascii_lowercase(),
-            "--env".to_string(),
-            "KBCTL_TRANSPORT=herdr".to_string(),
-            "--env".to_string(),
-            format!(
-                "{}={}",
-                report_spool::SUBMISSION_FILE_ENV,
-                contract.submission_path
-            ),
-        ];
-        let workspace = self.command(&workspace_args).await?;
-        let (workspace_id, tab_id, pane_id) = self.workspace_ids(&workspace)?;
-        workspace_args.clear();
+        let tab_label = execution_tab_label(execution, contract);
+        let (workspace_id, tab_id, pane_id) =
+            if let Some(workspace_id) = contract.runtime_group_id.as_deref() {
+                match self
+                    .command(&tab_create_args(
+                        workspace_id,
+                        execution,
+                        contract,
+                        &tab_label,
+                    ))
+                    .await
+                {
+                    Ok(tab) => self.workspace_ids(&tab)?,
+                    Err(error) if workspace_is_gone(&error) => {
+                        self.create_workspace(execution, contract, &tab_label)
+                            .await?
+                    }
+                    Err(error) => return Err(error),
+                }
+            } else {
+                self.create_workspace(execution, contract, &tab_label)
+                    .await?
+            };
 
         let board_pane_id = self
             .open_board_pane(
@@ -506,6 +511,28 @@ impl AgentRuntime for HerdrRuntime {
     }
 }
 
+impl HerdrRuntime {
+    async fn create_workspace(
+        &self,
+        execution: &Execution,
+        contract: &WorkContract,
+        tab_label: &str,
+    ) -> Result<(String, String, String), KbctlError> {
+        let workspace = self
+            .command(&workspace_create_args(execution, contract))
+            .await?;
+        let ids = self.workspace_ids(&workspace)?;
+        self.command(&[
+            "tab".to_string(),
+            "rename".to_string(),
+            ids.1.clone(),
+            tab_label.to_string(),
+        ])
+        .await?;
+        Ok(ids)
+    }
+}
+
 #[cfg(unix)]
 async fn subscribe_to_pane_events(pane_id: String, sender: broadcast::Sender<RuntimeEvent>) {
     use sha2::{Digest, Sha256};
@@ -595,6 +622,75 @@ fn find_string_key<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
         Value::Array(values) => values.iter().find_map(|value| find_string_key(value, key)),
         _ => None,
     }
+}
+
+fn execution_environment_args(execution: &Execution, contract: &WorkContract) -> Vec<String> {
+    [
+        format!("KBCTL_EXECUTION_ID={}", execution.id),
+        format!("KBCTL_TASK_ID={}", execution.task_id),
+        format!(
+            "{}={}",
+            report_spool::REPORT_FILE_ENV,
+            report_spool::path_for(std::path::Path::new(&contract.project_path), &execution.id)
+                .display()
+        ),
+        format!("KBCTL_EXECUTION_MODE={}", execution.mode),
+        format!("KBCTL_EXECUTION_ROLE={:?}", execution.role).to_ascii_lowercase(),
+        "KBCTL_TRANSPORT=herdr".to_string(),
+        format!(
+            "{}={}",
+            report_spool::SUBMISSION_FILE_ENV,
+            contract.submission_path
+        ),
+    ]
+    .into_iter()
+    .flat_map(|value| ["--env".to_string(), value])
+    .collect()
+}
+
+fn workspace_create_args(execution: &Execution, contract: &WorkContract) -> Vec<String> {
+    let mut args = vec![
+        "workspace".to_string(),
+        "create".to_string(),
+        "--cwd".to_string(),
+        contract.project_path.clone(),
+        "--label".to_string(),
+        contract.project_name.clone(),
+        "--no-focus".to_string(),
+    ];
+    args.extend(execution_environment_args(execution, contract));
+    args
+}
+
+fn tab_create_args(
+    workspace_id: &str,
+    execution: &Execution,
+    contract: &WorkContract,
+    label: &str,
+) -> Vec<String> {
+    let mut args = vec![
+        "tab".to_string(),
+        "create".to_string(),
+        "--workspace".to_string(),
+        workspace_id.to_string(),
+        "--cwd".to_string(),
+        contract.project_path.clone(),
+        "--label".to_string(),
+        label.to_string(),
+        "--no-focus".to_string(),
+    ];
+    args.extend(execution_environment_args(execution, contract));
+    args
+}
+
+fn execution_tab_label(execution: &Execution, contract: &WorkContract) -> String {
+    let role = match execution.role {
+        crate::domain::ExecutionRole::Supervisor => "Supervisor",
+        crate::domain::ExecutionRole::Reviewer => "Review",
+        crate::domain::ExecutionRole::Worker => "Worker",
+        crate::domain::ExecutionRole::Standalone => "Task",
+    };
+    format!("{role} · {}", contract.title)
 }
 
 fn agent_arguments(contract: &WorkContract) -> Vec<String> {
@@ -895,6 +991,12 @@ fn pane_is_gone(error: &KbctlError) -> bool {
     error.to_string().contains("pane_not_found")
 }
 
+fn workspace_is_gone(error: &KbctlError) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("workspace_not_found")
+        || (message.contains("workspace") && message.contains("not found"))
+}
+
 fn foreground_agent_present(value: &Value, agent_kind: &str) -> bool {
     let Some(processes) = value
         .get("result")
@@ -929,6 +1031,33 @@ fn foreground_agent_present(value: &Value, agent_kind: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn contract(runtime_group_id: Option<&str>) -> WorkContract {
+        WorkContract {
+            task_id: "task-1".to_string(),
+            execution_id: "exec-1".to_string(),
+            mode: crate::domain::ExecutionMode::Execute,
+            title: "Compare clients".to_string(),
+            body: "Research".to_string(),
+            project_name: "kbctl".to_string(),
+            project_path: "/tmp/kbctl".to_string(),
+            due: None,
+            scheduled_at: None,
+            agent_kind: "codex".to_string(),
+            profile_name: "fast_worker".to_string(),
+            role: crate::domain::ExecutionRole::Worker,
+            model: Some("gpt-5.6-luna".to_string()),
+            reasoning: Some("high".to_string()),
+            agent: None,
+            read_only: true,
+            plan_version: Some(1),
+            work_item_id: Some("work-1".to_string()),
+            submission_path: "/tmp/submission.json".to_string(),
+            report_command: "kbctl report submit".to_string(),
+            runtime_group_id: runtime_group_id.map(ToOwned::to_owned),
+            available_worker_profiles: Vec::new(),
+        }
+    }
 
     #[test]
     fn parses_success_and_failure_output() {
@@ -986,6 +1115,57 @@ mod tests {
         assert_eq!(
             HerdrRuntime::new("herdr").workspace_ids(&value).unwrap(),
             ("w4".to_string(), "w4:t1".to_string(), "w4:p1".to_string())
+        );
+    }
+
+    #[test]
+    fn first_execution_creates_a_project_workspace() {
+        let mut execution =
+            Execution::new("task-1", "codex", crate::domain::ExecutionMode::Execute);
+        execution.id = "exec-1".to_string();
+        execution.role = crate::domain::ExecutionRole::Worker;
+        let args = workspace_create_args(&execution, &contract(None));
+        assert_eq!(
+            &args[..7],
+            [
+                "workspace",
+                "create",
+                "--cwd",
+                "/tmp/kbctl",
+                "--label",
+                "kbctl",
+                "--no-focus"
+            ]
+        );
+        assert!(args.contains(&"KBCTL_EXECUTION_ID=exec-1".to_string()));
+    }
+
+    #[test]
+    fn later_execution_creates_a_labeled_tab_in_the_project_workspace() {
+        let mut execution =
+            Execution::new("task-1", "codex", crate::domain::ExecutionMode::Execute);
+        execution.id = "exec-1".to_string();
+        execution.role = crate::domain::ExecutionRole::Worker;
+        let value = contract(Some("w1"));
+        let args = tab_create_args(
+            value.runtime_group_id.as_deref().unwrap(),
+            &execution,
+            &value,
+            &execution_tab_label(&execution, &value),
+        );
+        assert_eq!(
+            &args[..9],
+            [
+                "tab",
+                "create",
+                "--workspace",
+                "w1",
+                "--cwd",
+                "/tmp/kbctl",
+                "--label",
+                "Worker · Compare clients",
+                "--no-focus"
+            ]
         );
     }
 
