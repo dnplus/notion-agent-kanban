@@ -1,8 +1,8 @@
 use crate::{
     config::{Config, LocalProjectBinding},
     domain::{
-        Execution, ExecutionMode, ExecutionRole, OrchestrationRun, PlanState, Task, TaskStatus,
-        WorkContract, WorkItem, WorkItemState, WorkMode,
+        Execution, ExecutionMode, ExecutionRole, OrchestrationRun, PlanState, SubmissionEnvelope,
+        Task, TaskStatus, WorkContract, WorkItem, WorkItemState, WorkMode,
     },
     error::KbctlError,
     git_workspace,
@@ -780,12 +780,21 @@ impl Daemon {
         }
         items = self.store.work_items(&task.id, run.plan_version)?;
         if run.state == PlanState::Done {
+            let result = match run.supervisor_execution_id.as_deref() {
+                Some(execution_id) => match self.store.submission(execution_id)? {
+                    Some(SubmissionEnvelope::Review { review }) if review.target_id == task.id => {
+                        review.summary
+                    }
+                    _ => format!("plan v{} accepted", run.plan_version),
+                },
+                None => format!("plan v{} accepted", run.plan_version),
+            };
             self.provider
                 .update_task(TaskUpdate {
                     id: task.id.clone(),
                     status: Some(TaskStatus::Done),
                     clear_execution_id: true,
-                    result: Some(format!("plan v{} accepted", run.plan_version)),
+                    result: Some(result),
                     ..Default::default()
                 })
                 .await?;
@@ -1321,7 +1330,10 @@ mod tests {
     use super::*;
     use crate::{
         config::{DaemonConfig, HerdrConfig, LocalProjectBinding, NotionConfig, ProjectConfig},
-        domain::{Report, Task},
+        domain::{
+            OrchestrationRun, PlanDag, PlanState, Report, ReviewDecision, ReviewDecisionKind,
+            SubmissionEnvelope, Task,
+        },
         herdr::RuntimeState,
         notion::ProjectUpdate,
     };
@@ -1659,6 +1671,77 @@ mod tests {
         assert_eq!(finished.result.as_deref(), Some("finished"));
         assert_eq!(provider.appended.lock().unwrap().len(), 1);
         assert_eq!(daemon.flush_reports_once().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn final_parent_review_summary_is_written_to_notion_result() {
+        let directory = tempfile::tempdir().unwrap();
+        let provider = FakeProvider {
+            tasks: Arc::new(Mutex::new(vec![task(
+                TaskStatus::Running,
+                Some(Utc::now() + ChronoDuration::hours(1)),
+            )])),
+            appended: Arc::new(Mutex::new(Vec::new())),
+        };
+        let runtime = FakeRuntime {
+            state: Arc::new(Mutex::new(RuntimeState::Done)),
+        };
+        let store = Store::open(directory.path().join("state.db")).unwrap();
+        let mut supervisor = Execution::new("task-1", "codex", ExecutionMode::Triage);
+        supervisor.role = ExecutionRole::Supervisor;
+        supervisor.parent_task_id = Some("task-1".to_string());
+        supervisor.plan_version = Some(1);
+        store.save_execution(&supervisor).unwrap();
+        store
+            .mark_execution_state(&supervisor.id, "submitted")
+            .unwrap();
+        store
+            .save_plan(&PlanDag {
+                parent_task_id: "task-1".to_string(),
+                version: 1,
+                summary: "plan".to_string(),
+                steps: Vec::new(),
+            })
+            .unwrap();
+        store
+            .save_orchestration_run(&OrchestrationRun {
+                parent_task_id: "task-1".to_string(),
+                plan_version: 1,
+                state: PlanState::Done,
+                supervisor_execution_id: Some(supervisor.id.clone()),
+                approved_plan_version: None,
+                base_commit: None,
+                base_branch: None,
+                integration_branch: None,
+                updated_at: Utc::now(),
+            })
+            .unwrap();
+        store
+            .record_submission(
+                &supervisor.id,
+                &SubmissionEnvelope::Review {
+                    review: ReviewDecision {
+                        target_id: "task-1".to_string(),
+                        decision: ReviewDecisionKind::Accept,
+                        summary: "integrated final result".to_string(),
+                        review_round: 0,
+                        findings: Vec::new(),
+                    },
+                },
+            )
+            .unwrap();
+        let daemon = Daemon::new(
+            config(directory.path().to_str().unwrap()),
+            Arc::new(provider.clone()),
+            Arc::new(runtime),
+            store,
+        );
+
+        daemon.run_once().await.unwrap();
+
+        let task = provider.tasks.lock().unwrap()[0].clone();
+        assert_eq!(task.status, TaskStatus::Done);
+        assert_eq!(task.result.as_deref(), Some("integrated final result"));
     }
 
     #[tokio::test]
