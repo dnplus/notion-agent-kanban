@@ -763,6 +763,24 @@ impl Daemon {
                 None => format!("plan v{} accepted", run.plan_version),
             };
             self.provider
+                .append_result(
+                    &task.id,
+                    &format!(
+                        "kbctl-orchestration:{}:v{}\n{}",
+                        task.id, run.plan_version, result
+                    ),
+                )
+                .await?;
+            if let Some(project_id) = task.project_id.clone() {
+                self.provider
+                    .update_project(ProjectUpdate {
+                        id: project_id,
+                        last_activity: Some(run.updated_at),
+                        ..Default::default()
+                    })
+                    .await?;
+            }
+            self.provider
                 .update_task(TaskUpdate {
                     id: task.id.clone(),
                     status: Some(TaskStatus::Done),
@@ -1194,15 +1212,6 @@ impl Daemon {
         self.provider
             .append_result(&task.id, &pending.result_text)
             .await?;
-        self.provider
-            .update_task(TaskUpdate {
-                id: task.id.clone(),
-                status: Some(pending.report.status),
-                clear_execution_id: true,
-                result: Some(result_summary.clone()),
-                ..Default::default()
-            })
-            .await?;
         if let Some(project_id) = task.project_id.clone() {
             self.provider
                 .update_project(ProjectUpdate {
@@ -1212,6 +1221,15 @@ impl Daemon {
                 })
                 .await?;
         }
+        self.provider
+            .update_task(TaskUpdate {
+                id: task.id.clone(),
+                status: Some(pending.report.status),
+                clear_execution_id: true,
+                result: Some(result_summary.clone()),
+                ..Default::default()
+            })
+            .await?;
         let mut completed_task = task;
         completed_task.status = pending.report.status;
         completed_task.execution_id = None;
@@ -1393,6 +1411,12 @@ mod tests {
         fail_append_once: Arc<Mutex<bool>>,
     }
 
+    #[derive(Clone)]
+    struct ProjectRecordingProvider {
+        inner: FakeProvider,
+        updates: Arc<Mutex<Vec<ProjectUpdate>>>,
+    }
+
     #[async_trait]
     impl KanbanProvider for AppendOnceProvider {
         async fn discover_schema(
@@ -1432,6 +1456,37 @@ mod tests {
 
         async fn update_project(&self, update: ProjectUpdate) -> Result<(), KbctlError> {
             self.inner.update_project(update).await
+        }
+    }
+
+    #[async_trait]
+    impl KanbanProvider for ProjectRecordingProvider {
+        async fn discover_schema(
+            &self,
+            target: crate::notion::DatabaseTarget,
+        ) -> Result<crate::domain::SchemaSnapshot, KbctlError> {
+            self.inner.discover_schema(target).await
+        }
+
+        async fn list_tasks(&self) -> Result<Vec<Task>, KbctlError> {
+            self.inner.list_tasks().await
+        }
+
+        async fn get_task(&self, id: &str) -> Result<Task, KbctlError> {
+            self.inner.get_task(id).await
+        }
+
+        async fn update_task(&self, update: TaskUpdate) -> Result<(), KbctlError> {
+            self.inner.update_task(update).await
+        }
+
+        async fn append_result(&self, id: &str, result: &str) -> Result<(), KbctlError> {
+            self.inner.append_result(id, result).await
+        }
+
+        async fn update_project(&self, update: ProjectUpdate) -> Result<(), KbctlError> {
+            self.updates.lock().unwrap().push(update);
+            Ok(())
         }
     }
 
@@ -1622,12 +1677,19 @@ mod tests {
     #[tokio::test]
     async fn final_parent_review_summary_is_written_to_notion_result() {
         let directory = tempfile::tempdir().unwrap();
-        let provider = FakeProvider {
-            tasks: Arc::new(Mutex::new(vec![task(
-                TaskStatus::Running,
-                Some(Utc::now() + ChronoDuration::hours(1)),
-            )])),
+        let mut parent = task(
+            TaskStatus::Running,
+            Some(Utc::now() + ChronoDuration::hours(1)),
+        );
+        parent.project_id = Some("project-1".to_string());
+        let inner = FakeProvider {
+            tasks: Arc::new(Mutex::new(vec![parent])),
             appended: Arc::new(Mutex::new(Vec::new())),
+        };
+        let updates = Arc::new(Mutex::new(Vec::new()));
+        let provider = ProjectRecordingProvider {
+            inner: inner.clone(),
+            updates: updates.clone(),
         };
         let runtime = FakeRuntime {
             state: Arc::new(Mutex::new(RuntimeState::Done)),
@@ -1685,9 +1747,13 @@ mod tests {
 
         daemon.run_once().await.unwrap();
 
-        let task = provider.tasks.lock().unwrap()[0].clone();
+        let task = inner.tasks.lock().unwrap()[0].clone();
         assert_eq!(task.status, TaskStatus::Done);
         assert_eq!(task.result.as_deref(), Some("integrated final result"));
+        assert_eq!(inner.appended.lock().unwrap().len(), 1);
+        assert!(inner.appended.lock().unwrap()[0].starts_with("kbctl-orchestration:task-1:v1\n"));
+        assert_eq!(updates.lock().unwrap().len(), 1);
+        assert_eq!(updates.lock().unwrap()[0].id, "project-1");
     }
 
     #[tokio::test]
