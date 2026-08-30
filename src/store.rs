@@ -532,4 +532,19 @@ mod tests {
         assert_eq!(cached[0].id, second.id);
         assert_eq!(cached[0].status, second.status);
     }
+
+    #[test]
+    fn execution_for_task_returns_only_the_current_running_attempt() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path().join("state.db")).unwrap();
+        let old = Execution::new_with_attempt("task-1", "codex", ExecutionMode::Execute, 1);
+        store.save_execution(&old).unwrap();
+        store.mark_execution_state(&old.id, "reported").unwrap();
+        let current = Execution::new_with_attempt("task-1", "codex", ExecutionMode::Execute, 2);
+        store.save_execution(&current).unwrap();
+        assert_eq!(
+            store.execution_for_task("task-1").unwrap().unwrap().id,
+            current.id
+        );
+    }
 }

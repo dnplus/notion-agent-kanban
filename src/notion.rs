@@ -51,7 +51,7 @@ pub struct InitializationResult {
     pub projects_database_id: String,
     pub projects_data_source_id: String,
     pub default_project_id: String,
-    pub board_view_id: Option<String>,
+    pub board_view_id: String,
 }
 
 #[async_trait]
@@ -113,6 +113,83 @@ impl NotionProvider {
             .into_stream()
             .try_collect::<Vec<PageResponse>>()
             .await
+            .map_err(notion_error)
+    }
+
+    pub async fn ensure_board_view(&self) -> Result<String, KbctlError> {
+        let database_id = self
+            .config
+            .notion
+            .tasks_database_id
+            .as_deref()
+            .ok_or_else(|| KbctlError::Config("Tasks database is not configured".to_string()))?;
+        let data_source_id = self
+            .config
+            .notion
+            .tasks_data_source_id
+            .as_deref()
+            .ok_or_else(|| KbctlError::Config("Tasks data source is not configured".to_string()))?;
+        let schema = self.retrieve_schema(data_source_id).await?;
+        let status_property_id = required_property_id(&schema.properties, "Status")?;
+        self.upsert_board_view(database_id, data_source_id, &status_property_id)
+            .await
+    }
+
+    async fn upsert_board_view(
+        &self,
+        database_id: &str,
+        data_source_id: &str,
+        status_property_id: &str,
+    ) -> Result<String, KbctlError> {
+        let mut cursor = None;
+        loop {
+            let request = self
+                .client
+                .list_views()
+                .database_id(database_id)
+                .page_size(100);
+            let request = cursor.map_or(request.clone(), |cursor| request.start_cursor(cursor));
+            let views = request.send().await.map_err(notion_error)?;
+            for view in &views.results {
+                let view = self
+                    .client
+                    .retrieve_view()
+                    .view_id(&view.id)
+                    .send()
+                    .await
+                    .map_err(notion_error)?;
+                if view.name == "Agent Board" && view.r#type == ViewType::Board {
+                    let view = self
+                        .client
+                        .update_view()
+                        .view_id(view.id)
+                        .filter(board_view_filter(status_property_id))
+                        .configuration(board_view_configuration(status_property_id))
+                        .send()
+                        .await
+                        .map_err(notion_error)?;
+                    return Ok(view.id);
+                }
+            }
+            if !views.has_more.unwrap_or(false) {
+                break;
+            }
+            cursor = views.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        self.client
+            .create_view()
+            .database_id(database_id)
+            .data_source_id(data_source_id)
+            .name("Agent Board")
+            .view_type(ViewType::Board)
+            .filter(board_view_filter(status_property_id))
+            .configuration(board_view_configuration(status_property_id))
+            .send()
+            .await
+            .map(|view| view.id)
             .map_err(notion_error)
     }
 
@@ -251,33 +328,32 @@ impl NotionProvider {
                 return Err(error);
             }
         };
-        let status_property_id = tasks_schema_for_view
-            .properties
-            .get("Status")
-            .and_then(|value| value.get("id"))
-            .and_then(Value::as_str)
-            .unwrap_or("Status")
-            .to_string();
-        let board_view = self
-            .client
-            .create_view()
-            .database_id(tasks_database.id.clone())
-            .data_source_id(tasks_data_source_id.clone())
-            .name("Agent Board")
-            .view_type(ViewType::Board)
-            .configuration(json!({
-                "type": "board",
-                "group_by": {
-                    "type": "status",
-                    "property_id": status_property_id,
-                    "group_by": "group",
-                    "sort": { "type": "manual" }
+        let status_property_id =
+            match required_property_id(&tasks_schema_for_view.properties, "Status") {
+                Ok(id) => id,
+                Err(error) => {
+                    let _ = self.archive_page(&default_project.id).await;
+                    let _ = self.archive_database(&tasks_database.id).await;
+                    let _ = self.archive_database(&projects_database.id).await;
+                    return Err(error);
                 }
-            }))
-            .send()
+            };
+        let board_view_id = match self
+            .upsert_board_view(
+                &tasks_database.id,
+                &tasks_data_source_id,
+                &status_property_id,
+            )
             .await
-            .map_err(notion_error)
-            .ok();
+        {
+            Ok(view_id) => view_id,
+            Err(error) => {
+                let _ = self.archive_page(&default_project.id).await;
+                let _ = self.archive_database(&tasks_database.id).await;
+                let _ = self.archive_database(&projects_database.id).await;
+                return Err(error);
+            }
+        };
 
         let tasks_schema = match self.retrieve_schema(&tasks_data_source_id).await {
             Ok(schema) => schema,
@@ -316,7 +392,7 @@ impl NotionProvider {
             projects_database_id: projects_database.id,
             projects_data_source_id,
             default_project_id: default_project.id,
-            board_view_id: board_view.map(|view| view.id),
+            board_view_id,
         })
     }
 
@@ -1046,6 +1122,37 @@ fn default_status_options() -> std::collections::BTreeMap<String, String> {
     .collect()
 }
 
+fn required_property_id(properties: &Value, name: &str) -> Result<String, KbctlError> {
+    properties
+        .get(name)
+        .and_then(|value| value.get("id"))
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| KbctlError::Validation(format!("{name} property has no stable id")))
+}
+
+fn board_view_filter(status_property_id: &str) -> Value {
+    json!({
+        "property": status_property_id,
+        "status": {"does_not_equal": "archived"}
+    })
+}
+
+fn board_view_configuration(status_property_id: &str) -> Value {
+    json!({
+        "type": "board",
+        "group_by": {
+            "type": "status",
+            "property_id": status_property_id,
+            "group_by": "option",
+            "sort": {"type": "manual"},
+            "hide_empty_groups": false
+        },
+        "card_layout": "compact"
+    })
+}
+
 fn task_schema(
     project_data_source_id: &str,
 ) -> Result<HashMap<String, DataSourceProperty>, KbctlError> {
@@ -1251,6 +1358,30 @@ mod tests {
         assert_eq!(
             missing_required_property(&properties, REQUIRED_TASK_PROPERTIES).unwrap_err(),
             "Status"
+        );
+    }
+
+    #[test]
+    fn board_view_uses_individual_status_columns_and_keeps_empty_groups() {
+        let configuration = board_view_configuration("status-id");
+        assert_eq!(configuration["group_by"]["group_by"], "option");
+        assert_eq!(configuration["group_by"]["hide_empty_groups"], false);
+        assert_eq!(configuration["card_layout"], "compact");
+        assert_eq!(
+            board_view_filter("status-id"),
+            json!({
+                "property": "status-id",
+                "status": {"does_not_equal": "archived"}
+            })
+        );
+    }
+
+    #[test]
+    fn board_view_requires_the_stable_status_property_id() {
+        assert!(required_property_id(&json!({"Status": {}}), "Status").is_err());
+        assert_eq!(
+            required_property_id(&json!({"Status": {"id": "status-id"}}), "Status").unwrap(),
+            "status-id"
         );
     }
 }

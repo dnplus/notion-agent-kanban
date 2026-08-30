@@ -51,9 +51,11 @@ export NOTION_API_TOKEN=ntn_...
 kbctl init
 ```
 
-`kbctl init` always creates a new Tasks database, Projects database, default Project, and Agent Board. Without `--parent` it uses a workspace-level parent (Private, for PATs that support that). After init you can move those databases to another workspace; kbctl keeps using the stored database ids as long as the current token can still reach them.
+On first run, `kbctl init` creates a new Tasks database, Projects database, default Project, and Agent Board. Without `--parent` it uses a workspace-level parent (Private, for PATs that support that). After init you can move those databases to another workspace; kbctl keeps using the stored database ids as long as the current token can still reach them.
 
 `--parent <page-id-or-url>` only sets the page for that first create.
+
+Running `kbctl init` again does not recreate the databases. It idempotently verifies and repairs the `Agent Board` view: one column per Status option, empty columns kept visible, and `archived` filtered out by default.
 
 Bind a local directory and choose the Herdr agent kind (default is `codex`):
 
@@ -85,7 +87,9 @@ Herdr idle/done is not process exit. The daemon treats the execution as finished
 
 `n` creates a task in Notion: title, then backlog / triage / scheduled / ready. New tasks get a due date of tomorrow so the daemon can dispatch them. Left-click opens the action menu; right-click stays Herdr’s pane menu. `1`/`2`/`3`/`4` move to backlog/triage/scheduled/ready, `c` cancels, `f` focuses the Herdr execution. Status changes need a Notion token; without a network the last cache remains.
 
-`kbctl install --herdr` docks a narrow board split on the current Herdr tab. When the plugin is linked, each daemon-created execution workspace gets the same board pane beside the agent. A failed board pane is a warning only. Reinstall closes the current tab’s old board pane first so the new binary loads.
+`kbctl install --herdr` docks a narrow board split on the current Herdr tab. The manifest points at the stable `~/.local/bin/kbctl` installation instead of a build-directory binary. When the plugin is linked, each daemon-created execution workspace gets the same board pane beside the agent, with its task and execution context injected into the pane. A failed per-execution board pane is a warning only. Reinstall opens and verifies the replacement before closing the current tab’s old board pane, so an action failure does not leave an empty layout.
+
+The Herdr plugin actions are context-aware: `Open kbctl board` selects the task attached to the focused pane when one exists; `Open current task` reopens the board for that task; `Focus current task` focuses its agent; and `Cancel current task` performs the normal validated cancel flow. Actions use Herdr’s invocation context and the local execution cache, so they refuse to guess when the focused pane is not associated with a kbctl task.
 
 ## Commands
 
@@ -97,6 +101,12 @@ kbctl project bind <project-id-or-default> <directory>
 kbctl task move <task-id> ready
 kbctl report done --execution <execution-id> --summary "what changed and how it was verified"
 kbctl install --grok
+
+# Herdr context actions
+herdr plugin action invoke kbctl.open-board
+herdr plugin action invoke kbctl.task-detail
+herdr plugin action invoke kbctl.focus-task
+herdr plugin action invoke kbctl.cancel-task
 ```
 
 Config: `~/.config/kbctl/config.toml`. State: `~/.local/share/kbctl/state.db`. Override with `KBCTL_CONFIG` and `KBCTL_STATE`.

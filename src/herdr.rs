@@ -6,8 +6,12 @@ use crate::{
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{path::PathBuf, process::Stdio};
-use tokio::process::Command;
+use std::{
+    ffi::OsStr,
+    path::PathBuf,
+    process::{Command as SyncCommand, Stdio},
+};
+use tokio::process::Command as TokioCommand;
 use tokio::time::{Duration, sleep};
 
 const HERDR_INTERRUPT_KEY: &str = "ctrl+c";
@@ -27,9 +31,17 @@ pub struct RuntimeExecution {
     pub workspace_id: String,
     pub tab_id: String,
     pub pane_id: String,
+    #[serde(default)]
+    pub board_pane_id: Option<String>,
     pub agent_name: String,
     #[serde(default)]
     pub agent_kind: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BoardPaneContext<'a> {
+    pub task_id: &'a str,
+    pub execution_id: Option<&'a str>,
 }
 
 #[async_trait]
@@ -138,26 +150,43 @@ impl HerdrRuntime {
         }))
     }
 
-    async fn open_board_pane(&self, target_pane: &str, cwd: &str) {
-        match self.command(&board_pane_open_args(target_pane, cwd)).await {
+    async fn open_board_pane(
+        &self,
+        target_pane: &str,
+        cwd: &str,
+        task_id: &str,
+        execution_id: &str,
+    ) -> Option<String> {
+        match self
+            .command(&board_pane_open_args(
+                target_pane,
+                cwd,
+                Some(BoardPaneContext {
+                    task_id,
+                    execution_id: Some(execution_id),
+                }),
+            ))
+            .await
+        {
             Ok(value) => {
-                if first_nested_string(
+                let board_pane_id = first_nested_string(
                     &value,
                     &[
                         &["result", "plugin_pane", "pane", "pane_id"],
                         &["plugin_pane", "pane", "pane_id"],
                     ],
-                )
-                .is_none()
-                {
+                );
+                if board_pane_id.is_none() {
                     tracing::warn!(target_pane, "Herdr did not return the kbctl board pane id");
                 }
                 if let Err(error) = self.command(&board_pane_resize_args(target_pane)).await {
                     tracing::warn!(target_pane, error = %error, "resize Herdr kbctl board pane failed");
                 }
+                board_pane_id
             }
             Err(error) => {
                 tracing::warn!(target_pane, error = %error, "open Herdr kbctl board pane failed");
+                None
             }
         }
     }
@@ -197,7 +226,14 @@ impl AgentRuntime for HerdrRuntime {
         let (workspace_id, tab_id, pane_id) = self.workspace_ids(&workspace)?;
         workspace_args.clear();
 
-        self.open_board_pane(&pane_id, &contract.project_path).await;
+        let board_pane_id = self
+            .open_board_pane(
+                &pane_id,
+                &contract.project_path,
+                &execution.task_id,
+                &execution.id,
+            )
+            .await;
 
         let mut start_args = vec![
             "agent".to_string(),
@@ -228,6 +264,7 @@ impl AgentRuntime for HerdrRuntime {
             workspace_id,
             tab_id,
             pane_id,
+            board_pane_id,
             agent_name: started_name,
             agent_kind: contract.agent_kind.clone(),
         };
@@ -305,7 +342,7 @@ impl AgentRuntime for HerdrRuntime {
 }
 
 async fn run_json(binary: &PathBuf, args: &[String]) -> Result<Value, KbctlError> {
-    let output = Command::new(binary)
+    let output = TokioCommand::new(binary)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -313,6 +350,20 @@ async fn run_json(binary: &PathBuf, args: &[String]) -> Result<Value, KbctlError
         .output()
         .await
         .map_err(|error| KbctlError::Runtime(format!("run {}: {error}", binary.display())))?;
+    parse_output(output.status.success(), &output.stdout, &output.stderr)
+}
+
+pub(crate) fn run_sync_json<S>(binary: &str, args: &[S]) -> Result<Value, KbctlError>
+where
+    S: AsRef<OsStr>,
+{
+    let output = SyncCommand::new(binary)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|error| KbctlError::Runtime(format!("run {binary}: {error}")))?;
     parse_output(output.status.success(), &output.stdout, &output.stderr)
 }
 
@@ -386,7 +437,7 @@ fn nested_string(value: &Value, path: &[&str]) -> Option<String> {
     current.as_str().map(ToOwned::to_owned)
 }
 
-fn first_nested_string(value: &Value, paths: &[&[&str]]) -> Option<String> {
+pub(crate) fn first_nested_string(value: &Value, paths: &[&[&str]]) -> Option<String> {
     paths.iter().find_map(|path| nested_string(value, path))
 }
 
@@ -409,8 +460,12 @@ fn prompt_command_args(target: &str, text: &str) -> Vec<String> {
     ]
 }
 
-fn board_pane_open_args(target_pane: &str, cwd: &str) -> Vec<String> {
-    vec![
+pub(crate) fn board_pane_open_args(
+    target_pane: &str,
+    cwd: &str,
+    context: Option<BoardPaneContext<'_>>,
+) -> Vec<String> {
+    let mut args = vec![
         "plugin".to_string(),
         "pane".to_string(),
         "open".to_string(),
@@ -426,11 +481,20 @@ fn board_pane_open_args(target_pane: &str, cwd: &str) -> Vec<String> {
         "right".to_string(),
         "--cwd".to_string(),
         cwd.to_string(),
-        "--no-focus".to_string(),
-    ]
+    ];
+    if let Some(context) = context {
+        args.push("--env".to_string());
+        args.push(format!("KBCTL_CONTEXT_TASK_ID={}", context.task_id));
+        if let Some(execution_id) = context.execution_id {
+            args.push("--env".to_string());
+            args.push(format!("KBCTL_CONTEXT_EXECUTION_ID={execution_id}"));
+        }
+    }
+    args.push("--no-focus".to_string());
+    args
 }
 
-fn board_pane_resize_args(target_pane: &str) -> Vec<String> {
+pub(crate) fn board_pane_resize_args(target_pane: &str) -> Vec<String> {
     vec![
         "pane".to_string(),
         "resize".to_string(),
@@ -563,12 +627,23 @@ mod tests {
             workspace_id: "w1".to_string(),
             tab_id: "t1".to_string(),
             pane_id: "p1".to_string(),
+            board_pane_id: Some("p2".to_string()),
             agent_name: "kbctl-a".to_string(),
             agent_kind: "codex".to_string(),
         };
         let encoded = serde_json::to_string(&runtime).unwrap();
         let decoded: RuntimeExecution = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded.agent_name, "kbctl-a");
+        assert_eq!(decoded.board_pane_id.as_deref(), Some("p2"));
+    }
+
+    #[test]
+    fn old_runtime_ids_remain_readable() {
+        let decoded: RuntimeExecution = serde_json::from_str(
+            r#"{"workspace_id":"w1","tab_id":"t1","pane_id":"p1","agent_name":"kbctl-a"}"#,
+        )
+        .unwrap();
+        assert_eq!(decoded.board_pane_id, None);
     }
 
     #[test]
@@ -661,7 +736,14 @@ mod tests {
     #[test]
     fn opens_a_narrow_board_pane_in_the_agent_workspace() {
         assert_eq!(
-            board_pane_open_args("wA:p1", "/tmp/project"),
+            board_pane_open_args(
+                "wA:p1",
+                "/tmp/project",
+                Some(BoardPaneContext {
+                    task_id: "task-1",
+                    execution_id: Some("exec-1")
+                })
+            ),
             vec![
                 "plugin",
                 "pane",
@@ -678,6 +760,10 @@ mod tests {
                 "right",
                 "--cwd",
                 "/tmp/project",
+                "--env",
+                "KBCTL_CONTEXT_TASK_ID=task-1",
+                "--env",
+                "KBCTL_CONTEXT_EXECUTION_ID=exec-1",
                 "--no-focus"
             ]
             .into_iter()

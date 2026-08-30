@@ -4,6 +4,8 @@ pub mod daemon;
 pub mod domain;
 pub mod error;
 pub mod herdr;
+pub mod herdr_action;
+pub mod herdr_context;
 pub mod install;
 pub mod notion;
 pub mod report_spool;

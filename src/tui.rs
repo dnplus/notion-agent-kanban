@@ -46,6 +46,12 @@ const NEW_TASK_STATUSES: [TaskStatus; 4] = [
     TaskStatus::Ready,
 ];
 
+#[derive(Debug, Clone, Default)]
+pub struct BoardOptions {
+    pub task_id: Option<String>,
+    pub execution_id: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum CompactRow {
     Group(TaskStatus, usize),
@@ -249,7 +255,24 @@ fn is_compact(width: u16) -> bool {
     (width as usize) < BOARD_STATUSES.len() * 16
 }
 
-pub async fn run(config: Config) -> Result<(), KbctlError> {
+fn selected_task(tasks: &[Task], options: &BoardOptions) -> Option<usize> {
+    options
+        .execution_id
+        .as_deref()
+        .and_then(|execution_id| {
+            tasks
+                .iter()
+                .position(|task| task.execution_id.as_deref() == Some(execution_id))
+        })
+        .or_else(|| {
+            options
+                .task_id
+                .as_deref()
+                .and_then(|task_id| tasks.iter().position(|task| task.id == task_id))
+        })
+}
+
+pub async fn run(config: Config, options: BoardOptions) -> Result<(), KbctlError> {
     let store = Store::open(default_state_path())?;
     let provider = NotionProvider::new(config.clone()).ok();
     let runtime = HerdrRuntime::new(config.herdr.binary);
@@ -257,6 +280,10 @@ pub async fn run(config: Config) -> Result<(), KbctlError> {
     let mut message = None;
     if tasks.is_empty() {
         message = refresh_tasks(provider.as_ref(), &store, &mut tasks).await;
+    }
+    let selected = selected_task(&tasks, &options);
+    if selected.is_none() && (options.task_id.is_some() || options.execution_id.is_some()) {
+        message = Some("context task is not in the local cache".to_string());
     }
     terminal::enable_raw_mode()
         .map_err(|error| KbctlError::Runtime(format!("enable board terminal: {error}")))?;
@@ -272,6 +299,7 @@ pub async fn run(config: Config) -> Result<(), KbctlError> {
         &runtime,
         &mut tasks,
         &mut message,
+        selected.unwrap_or(0),
         &mut terminal,
     )
     .await;
@@ -292,9 +320,10 @@ async fn board_loop(
     runtime: &HerdrRuntime,
     tasks: &mut Vec<Task>,
     message: &mut Option<String>,
+    initial_selected: usize,
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
 ) -> Result<(), KbctlError> {
-    let mut selected = 0usize;
+    let mut selected = initial_selected;
     let mut cache_refresh_at = Instant::now() + Duration::from_secs(1);
     let mut menu = None;
     let mut new_task = None;
@@ -1081,6 +1110,82 @@ mod tests {
         assert_eq!(
             compact_rows(&tasks).len(),
             BOARD_STATUSES.len() + tasks.len()
+        );
+    }
+
+    #[test]
+    fn context_task_is_selected_before_first_row() {
+        let tasks = vec![
+            task("task-1", TaskStatus::Backlog),
+            task("task-2", TaskStatus::Ready),
+        ];
+        assert_eq!(
+            selected_task(
+                &tasks,
+                &BoardOptions {
+                    task_id: Some("task-2".to_string()),
+                    execution_id: None,
+                }
+            ),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn context_execution_selects_attached_task() {
+        let tasks = vec![Task {
+            id: "task-1".to_string(),
+            execution_id: Some("exec-1".to_string()),
+            status: TaskStatus::Running,
+            ..Task::default()
+        }];
+        assert_eq!(
+            selected_task(
+                &tasks,
+                &BoardOptions {
+                    task_id: None,
+                    execution_id: Some("exec-1".to_string()),
+                }
+            ),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn context_execution_precedes_a_conflicting_task_id() {
+        let tasks = vec![
+            Task {
+                id: "task-1".to_string(),
+                execution_id: Some("exec-1".to_string()),
+                status: TaskStatus::Running,
+                ..Task::default()
+            },
+            task("task-2", TaskStatus::Ready),
+        ];
+        assert_eq!(
+            selected_task(
+                &tasks,
+                &BoardOptions {
+                    task_id: Some("task-2".to_string()),
+                    execution_id: Some("exec-1".to_string()),
+                }
+            ),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn stale_context_execution_falls_back_to_the_task_id() {
+        let tasks = vec![task("task-1", TaskStatus::Ready)];
+        assert_eq!(
+            selected_task(
+                &tasks,
+                &BoardOptions {
+                    task_id: Some("task-1".to_string()),
+                    execution_id: Some("old-exec".to_string()),
+                }
+            ),
+            Some(0)
         );
     }
 

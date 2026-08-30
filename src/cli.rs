@@ -4,6 +4,8 @@ use crate::{
     domain::{ExecutionMode, Report, TaskStatus},
     error::KbctlError,
     herdr::{AgentRuntime, HerdrRuntime},
+    herdr_action,
+    herdr_context::HerdrContext,
     install,
     notion::{KanbanProvider, NotionProvider, TaskUpdate},
     report_spool,
@@ -38,7 +40,7 @@ enum Command {
         #[command(subcommand)]
         command: DaemonCommand,
     },
-    Board,
+    Board(BoardArgs),
     Project {
         #[command(subcommand)]
         command: ProjectCommand,
@@ -56,6 +58,20 @@ enum Command {
     Install(InstallArgs),
     #[command(name = "_herdr-open-board", hide = true)]
     HerdrOpenBoard,
+    #[command(name = "_herdr-task-detail", hide = true)]
+    HerdrTaskDetail,
+    #[command(name = "_herdr-focus-task", hide = true)]
+    HerdrFocusTask,
+    #[command(name = "_herdr-cancel-task", hide = true)]
+    HerdrCancelTask,
+}
+
+#[derive(Debug, Args, Default)]
+struct BoardArgs {
+    #[arg(long, hide = true)]
+    task: Option<String>,
+    #[arg(long, hide = true)]
+    execution: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -134,7 +150,7 @@ pub async fn run() -> Result<()> {
         Command::Daemon {
             command: DaemonCommand::Run,
         } => run_daemon(config).await?,
-        Command::Board => run_board(config).await?,
+        Command::Board(args) => run_board(config, args).await?,
         Command::Project {
             command:
                 ProjectCommand::Bind {
@@ -151,16 +167,20 @@ pub async fn run() -> Result<()> {
         Command::Report { command } => report(config, command).await?,
         Command::Doctor => doctor(config).await?,
         Command::Install(args) => install::run(config, args.grok, args.codex, args.herdr)?,
-        Command::HerdrOpenBoard => install::open_herdr_board()?,
+        Command::HerdrOpenBoard => herdr_action::open_board()?,
+        Command::HerdrTaskDetail => herdr_action::open_task()?,
+        Command::HerdrFocusTask => focus_herdr_task(config).await?,
+        Command::HerdrCancelTask => cancel_herdr_task(config).await?,
     }
     Ok(())
 }
 
 async fn init(mut config: Config, config_path: Option<&Path>, args: InitArgs) -> Result<()> {
     if config.notion.tasks_database_id.is_some() {
-        println!(
-            "kbctl 已初始化。資料庫之後搬到哪個 workspace 都不必重跑 init，只要目前的 Notion token 仍能存取同一組 database。若要重建，先從設定檔移除 database ID。"
-        );
+        let board_view_id = NotionProvider::new(config.clone())?
+            .ensure_board_view()
+            .await?;
+        println!("kbctl 已初始化；Board view 已確認：{board_view_id}");
         return Ok(());
     }
     let provider = NotionProvider::new(config.clone())?;
@@ -181,9 +201,7 @@ async fn init(mut config: Config, config_path: Option<&Path>, args: InitArgs) ->
     println!("已建立 Tasks database：{}", result.tasks_database_id);
     println!("已建立 Projects database：{}", result.projects_database_id);
     println!("預設 Project：{}", result.default_project_id);
-    if let Some(view_id) = result.board_view_id {
-        println!("已建立 Board view：{}", view_id);
-    }
+    println!("已建立 Board view：{}", result.board_view_id);
     println!("設定已保存至 {}", path.display());
     Ok(())
 }
@@ -228,9 +246,39 @@ async fn run_daemon(config: Config) -> Result<()> {
     Ok(())
 }
 
-async fn run_board(config: Config) -> Result<()> {
-    tui::run(config).await?;
+async fn run_board(config: Config, args: BoardArgs) -> Result<()> {
+    let options = tui::BoardOptions {
+        task_id: args
+            .task
+            .or_else(|| std::env::var("KBCTL_CONTEXT_TASK_ID").ok()),
+        execution_id: args
+            .execution
+            .or_else(|| std::env::var("KBCTL_CONTEXT_EXECUTION_ID").ok()),
+    };
+    tui::run(config, options).await?;
     Ok(())
+}
+
+async fn focus_herdr_task(config: Config) -> Result<()> {
+    let store = Store::open(crate::config::default_state_path())?;
+    let target = HerdrContext::from_env()?.resolve(&store)?;
+    let execution = store.execution_for_task(&target.task.id)?.ok_or_else(|| {
+        KbctlError::Validation(format!("task {} has no active execution", target.task.id))
+    })?;
+    let runtime_id = execution.runtime_id.ok_or_else(|| {
+        KbctlError::Validation(format!("task {} has no Herdr runtime yet", target.task.id))
+    })?;
+    HerdrRuntime::new(config.herdr.binary)
+        .focus(&runtime_id)
+        .await?;
+    println!("focused task {}", target.task.id);
+    Ok(())
+}
+
+async fn cancel_herdr_task(config: Config) -> Result<()> {
+    let store = Store::open(crate::config::default_state_path())?;
+    let target = HerdrContext::from_env()?.resolve(&store)?;
+    move_task(config, target.task.id, TaskStatus::Cancel).await
 }
 
 async fn move_task(config: Config, task_id: String, status: TaskStatus) -> Result<()> {

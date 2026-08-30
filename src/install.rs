@@ -1,9 +1,8 @@
-use crate::{config::Config, error::KbctlError};
+use crate::{config::Config, error::KbctlError, herdr::run_sync_json};
 use serde_json::Value;
 use std::{
     env, fs,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
 };
 
 pub fn run(config: Config, grok: bool, codex: bool, herdr: bool) -> Result<(), KbctlError> {
@@ -26,17 +25,8 @@ pub fn run(config: Config, grok: bool, codex: bool, herdr: bool) -> Result<(), K
     }
     if herdr {
         let path = herdr_plugin_path(&config);
-        let executable = env::current_exe()
-            .map_err(|error| KbctlError::Runtime(format!("找不到 kbctl executable: {error}")))?;
-        let manifest = format!(
-            "id = \"kbctl\"\nname = \"kbctl\"\nversion = \"{}\"\nmin_herdr_version = \"0.8.0\"\nplatforms = [\"macos\", \"linux\", \"windows\"]\n\n[[panes]]\nid = \"board\"\ntitle = \"kbctl board\"\nplacement = \"split\"\ncommand = [{} , \"board\"]\n",
-            env!("CARGO_PKG_VERSION"),
-            toml_string(&executable.display().to_string()),
-        );
-        let manifest = format!(
-            "{manifest}\n[[actions]]\nid = \"open-board\"\ntitle = \"Open kbctl board\"\ndescription = \"Open the kbctl board as a docked Herdr sidebar.\"\ncommand = [{} , \"_herdr-open-board\"]\n",
-            toml_string(&executable.display().to_string()),
-        );
+        let executable = cli_binary_path();
+        let manifest = herdr_manifest(&executable);
         write_atomic(&path, &manifest)?;
         link_and_open_herdr(&config.herdr.binary, &path)?;
         println!("Herdr plugin manifest 已安裝：{}", path.display());
@@ -45,7 +35,7 @@ pub fn run(config: Config, grok: bool, codex: bool, herdr: bool) -> Result<(), K
 }
 
 fn link_and_open_herdr(binary: &str, manifest_path: &Path) -> Result<(), KbctlError> {
-    let plugins = run_herdr_json(binary, &["plugin", "list", "--json"])?;
+    let plugins = run_sync_json(binary, &["plugin", "list", "--json"])?;
     let linked = plugins
         .get("result")
         .and_then(|value| value.get("plugins"))
@@ -56,182 +46,12 @@ fn link_and_open_herdr(binary: &str, manifest_path: &Path) -> Result<(), KbctlEr
                 .any(|plugin| plugin.get("plugin_id").and_then(Value::as_str) == Some("kbctl"))
         });
     if linked {
-        run_herdr_json(binary, &["plugin", "unlink", "kbctl"])?;
+        run_sync_json(binary, &["plugin", "unlink", "kbctl"])?;
     }
     let path = manifest_path.to_string_lossy().to_string();
-    run_herdr_json(binary, &["plugin", "link", &path])?;
-    let panes = run_herdr_json(binary, &["pane", "list"])?;
-    let focused_tab = panes
-        .get("result")
-        .and_then(|value| value.get("panes"))
-        .and_then(Value::as_array)
-        .and_then(|panes| {
-            panes.iter().find_map(|pane| {
-                pane.get("focused")
-                    .and_then(Value::as_bool)
-                    .filter(|focused| *focused)
-                    .and_then(|_| pane.get("tab_id").and_then(Value::as_str))
-            })
-        });
-    let board_panes = panes
-        .get("result")
-        .and_then(|value| value.get("panes"))
-        .and_then(Value::as_array)
-        .map(|panes| {
-            panes
-                .iter()
-                .filter(|pane| {
-                    let in_focused_tab = focused_tab.is_none()
-                        || focused_tab == pane.get("tab_id").and_then(Value::as_str);
-                    (pane.get("terminal_title_stripped").and_then(Value::as_str)
-                        == Some("kbctl board")
-                        || pane.get("label").and_then(Value::as_str) == Some("kbctl board"))
-                        && in_focused_tab
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    for pane_id in board_panes.iter().filter_map(|pane| {
-        pane.get("pane_id")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned)
-    }) {
-        run_herdr_json(binary, &["pane", "close", &pane_id])?;
-    }
-    run_herdr_json(binary, &["plugin", "action", "invoke", "kbctl.open-board"])?;
+    run_sync_json(binary, &["plugin", "link", &path])?;
+    run_sync_json(binary, &["plugin", "action", "invoke", "kbctl.open-board"])?;
     Ok(())
-}
-
-pub fn open_herdr_board() -> Result<(), KbctlError> {
-    let binary = env::var("HERDR_BIN_PATH").unwrap_or_else(|_| "herdr".to_string());
-    let active_pane = env::var("HERDR_ACTIVE_PANE_ID")
-        .or_else(|_| env::var("HERDR_PANE_ID"))
-        .map_err(|_| {
-            KbctlError::Runtime(
-                "Herdr did not provide an active pane; run this action from Herdr".to_string(),
-            )
-        })?;
-    let panes = run_herdr_json(&binary, &["pane", "list"])?;
-    let pane_list = panes
-        .get("result")
-        .and_then(|value| value.get("panes"))
-        .and_then(Value::as_array)
-        .ok_or_else(|| KbctlError::Runtime("Herdr did not return pane list".to_string()))?;
-    let active_pane_info = pane_list
-        .iter()
-        .find(|pane| pane.get("pane_id").and_then(Value::as_str) == Some(active_pane.as_str()));
-    let active_tab = env::var("HERDR_ACTIVE_TAB_ID")
-        .or_else(|_| env::var("HERDR_TAB_ID"))
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| {
-            active_pane_info
-                .and_then(|pane| pane.get("tab_id").and_then(Value::as_str))
-                .map(ToOwned::to_owned)
-        });
-    let configured_cwd = Config::load(None)
-        .ok()
-        .and_then(|config| config.project.default.map(|binding| binding.path))
-        .map(PathBuf::from)
-        .filter(|path| path.is_dir())
-        .map(|path| path.to_string_lossy().to_string());
-    let cwd = configured_cwd
-        .or_else(|| env::var("HERDR_ACTIVE_PANE_CWD").ok())
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| {
-            active_pane_info.and_then(|pane| {
-                pane.get("foreground_cwd")
-                    .or_else(|| pane.get("cwd"))
-                    .and_then(Value::as_str)
-                    .map(ToOwned::to_owned)
-            })
-        })
-        .or_else(|| {
-            env::current_dir()
-                .ok()
-                .map(|path| path.to_string_lossy().to_string())
-        })
-        .ok_or_else(|| KbctlError::Runtime("resolve Herdr board cwd".to_string()))?;
-    let board_exists = pane_list.iter().any(|pane| {
-        let title = pane
-            .get("terminal_title_stripped")
-            .or_else(|| pane.get("label"))
-            .and_then(Value::as_str);
-        title == Some("kbctl board")
-            && active_tab.as_deref() == pane.get("tab_id").and_then(Value::as_str)
-    });
-    if board_exists {
-        return Ok(());
-    }
-    let args = vec![
-        "plugin".to_string(),
-        "pane".to_string(),
-        "open".to_string(),
-        "--plugin".to_string(),
-        "kbctl".to_string(),
-        "--entrypoint".to_string(),
-        "board".to_string(),
-        "--placement".to_string(),
-        "split".to_string(),
-        "--target-pane".to_string(),
-        active_pane.clone(),
-        "--direction".to_string(),
-        "right".to_string(),
-        "--cwd".to_string(),
-        cwd,
-        "--no-focus".to_string(),
-    ];
-    let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
-    run_herdr_json(&binary, &arg_refs)?;
-    run_herdr_json(
-        &binary,
-        &[
-            "pane",
-            "resize",
-            "--pane",
-            active_pane.as_str(),
-            "--direction",
-            "right",
-            "--amount",
-            "0.25",
-        ],
-    )?;
-    Ok(())
-}
-
-fn run_herdr_json(binary: &str, args: &[&str]) -> Result<Value, KbctlError> {
-    let output = Command::new(binary)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|error| KbctlError::Runtime(format!("run {binary}: {error}")))?;
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    let value = serde_json::from_str::<Value>(&stdout).map_err(|error| {
-        KbctlError::Runtime(format!(
-            "Herdr returned non-JSON output for {}: {}",
-            args.join(" "),
-            if stderr.is_empty() {
-                error.to_string()
-            } else {
-                stderr.clone()
-            }
-        ))
-    })?;
-    if !output.status.success() {
-        return Err(KbctlError::Runtime(
-            value
-                .get("error")
-                .map(ToString::to_string)
-                .unwrap_or_else(|| format!("Herdr command failed: {}", args.join(" "))),
-        ));
-    }
-    if let Some(error) = value.get("error") {
-        return Err(KbctlError::Runtime(error.to_string()));
-    }
-    Ok(value)
 }
 
 fn install_cli_binary() -> Result<(), KbctlError> {
@@ -301,6 +121,14 @@ fn herdr_plugin_path(config: &Config) -> PathBuf {
         .join("herdr-plugin.toml")
 }
 
+fn herdr_manifest(executable: &Path) -> String {
+    let executable = toml_string(&executable.display().to_string());
+    format!(
+        "id = \"kbctl\"\nname = \"kbctl\"\nversion = \"{}\"\nmin_herdr_version = \"0.8.0\"\ndescription = \"Context-aware Notion task control for Herdr\"\nplatforms = [\"macos\", \"linux\", \"windows\"]\n\n[[panes]]\nid = \"board\"\ntitle = \"kbctl board\"\nplacement = \"split\"\ncommand = [{executable} , \"board\"]\n\n[[actions]]\nid = \"open-board\"\ntitle = \"Open kbctl board\"\ndescription = \"Open the board and select the task associated with the focused Herdr pane.\"\ncontexts = [\"global\", \"workspace\", \"tab\", \"pane\"]\ncommand = [{executable} , \"_herdr-open-board\"]\n\n[[actions]]\nid = \"task-detail\"\ntitle = \"Open current task\"\ndescription = \"Open the focused pane's kbctl task in the board.\"\ncontexts = [\"workspace\", \"tab\", \"pane\"]\ncommand = [{executable} , \"_herdr-task-detail\"]\n\n[[actions]]\nid = \"focus-task\"\ntitle = \"Focus current task\"\ndescription = \"Focus the Herdr agent for the focused pane's kbctl task.\"\ncontexts = [\"pane\"]\ncommand = [{executable} , \"_herdr-focus-task\"]\n\n[[actions]]\nid = \"cancel-task\"\ntitle = \"Cancel current task\"\ndescription = \"Cancel the kbctl task associated with the focused Herdr pane.\"\ncontexts = [\"pane\"]\ncommand = [{executable} , \"_herdr-cancel-task\"]\n",
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
 fn write_atomic(path: &Path, content: &str) -> Result<(), KbctlError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
@@ -362,5 +190,16 @@ mod tests {
     #[test]
     fn cli_binary_installs_under_local_bin() {
         assert!(cli_binary_path().ends_with(".local/bin/kbctl"));
+    }
+
+    #[test]
+    fn herdr_manifest_declares_context_actions() {
+        let manifest = herdr_manifest(Path::new("/tmp/kbctl"));
+        assert!(manifest.contains("contexts = [\"global\", \"workspace\", \"tab\", \"pane\"]"));
+        assert!(manifest.contains("contexts = [\"workspace\", \"tab\", \"pane\"]"));
+        assert!(manifest.contains("id = \"task-detail\""));
+        assert!(manifest.contains("id = \"focus-task\""));
+        assert!(manifest.contains("id = \"cancel-task\""));
+        assert!(manifest.contains("_herdr-task-detail"));
     }
 }
