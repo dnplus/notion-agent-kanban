@@ -77,7 +77,7 @@ Notion Task (ready / triage / scheduled)
 
 `done` and `review` need a non-empty `--summary`. `blocked` needs a non-empty `--reason`. If the agent process exits without a valid report, the daemon returns the task to `ready` and retries after a delay, up to `max_attempts`, then sends it to `review`. Human `cancel` / `archived` is not retried.
 
-Herdr-dispatched agents write `kbctl report` to `.kbctl/reports/<execution-id>.json` in the project directory. The daemon ingests that spool, then owns SQLite and Notion writeback, so a Codex sandbox does not need `~/.local/share/kbctl/state.db`. A report from a normal terminal still uses local state/outbox directly.
+For Herdr-dispatched Supervisor and Worker executions, Herdr transports prompts, lifecycle events, and the final marked Base64-encoded JSON envelope. Base64 keeps the payload intact when a narrow terminal wraps output. The daemon reads, decodes, and validates that output, then owns SQLite and Notion writeback, so a read-only Agent does not need filesystem access to kbctl state. `kbctl report submit` remains available for manually managed orchestration, and standalone contracts keep the project-local report spool.
 
 Herdr idle/done is not process exit. The daemon treats the execution as finished only when the pane is gone or the foreground agent process has left.
 

@@ -7,8 +7,56 @@ use crate::{
     error::KbctlError,
     store::Store,
 };
+use base64::{Engine, engine::general_purpose::STANDARD};
 use chrono::Utc;
 use std::collections::{BTreeSet, HashMap};
+
+pub const ENVELOPE_BEGIN: &str = "KBCTL_ENVELOPE_BEGIN";
+pub const ENVELOPE_END: &str = "KBCTL_ENVELOPE_END";
+
+pub fn runtime_envelopes(output: &str) -> Vec<SubmissionEnvelope> {
+    let mut envelopes = Vec::new();
+    let mut encoded = String::new();
+    let mut collecting = false;
+    for line in output.lines() {
+        let marker = line.trim().strip_prefix('•').unwrap_or(line.trim()).trim();
+        match marker {
+            ENVELOPE_BEGIN => {
+                encoded.clear();
+                collecting = true;
+            }
+            ENVELOPE_END if collecting => {
+                let compact = encoded
+                    .chars()
+                    .filter(|value| !value.is_whitespace())
+                    .collect::<String>();
+                let envelope = serde_json::from_str(encoded.trim()).ok().or_else(|| {
+                    STANDARD
+                        .decode(compact)
+                        .ok()
+                        .and_then(|decoded| serde_json::from_slice(&decoded).ok())
+                });
+                if let Some(envelope) = envelope {
+                    envelopes.push(envelope);
+                }
+                encoded.clear();
+                collecting = false;
+            }
+            _ if collecting => {
+                encoded.push_str(line);
+                encoded.push('\n');
+            }
+            _ => {}
+        }
+    }
+    envelopes
+}
+
+pub fn runtime_envelope_instruction() -> String {
+    format!(
+        "不要執行 kbctl report，也不要寫 manifest。最終回覆可先包含給人的摘要，但最後必須輸出一個機器可讀區塊：起始行只能是 {ENVELOPE_BEGIN}，接著輸出 SubmissionEnvelope JSON 的標準 Base64 編碼，可被終端折成多行，結束行只能是 {ENVELOPE_END}。區塊後不要再輸出其他內容。"
+    )
+}
 
 pub fn validate_plan(config: &Config, plan: &PlanDag) -> Result<(), KbctlError> {
     plan.validate(config.orchestration.max_steps)
@@ -352,5 +400,30 @@ mod tests {
         plan.summary = "conflicting".to_string();
         assert!(apply_submission(&Config::default(), &store, &execution.id, &conflicting).is_err());
         assert_eq!(store.latest_plan("task").unwrap().unwrap().summary, "first");
+    }
+
+    #[test]
+    fn extracts_only_complete_runtime_envelopes() {
+        let json = r#"{"type":"completion","completion":{"work_item_id":"work-1","summary":"researched","head_commit":null,"artifacts":[],"known_issues":[]}}"#;
+        let encoded = STANDARD.encode(json);
+        let midpoint = encoded.len() / 2;
+        let output = format!(
+            r#"
+The prompt mentions KBCTL_ENVELOPE_BEGIN and KBCTL_ENVELOPE_END.
+• KBCTL_ENVELOPE_BEGIN
+  {}
+  {}
+KBCTL_ENVELOPE_END
+"#,
+            &encoded[..midpoint],
+            &encoded[midpoint..]
+        );
+        let envelopes = runtime_envelopes(&output);
+        assert_eq!(envelopes.len(), 1);
+        assert!(matches!(
+            &envelopes[0],
+            SubmissionEnvelope::Completion { completion }
+                if completion.work_item_id == "work-1" && completion.summary == "researched"
+        ));
     }
 }

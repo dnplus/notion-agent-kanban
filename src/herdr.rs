@@ -342,6 +342,8 @@ impl AgentRuntime for HerdrRuntime {
             "--env".to_string(),
             format!("KBCTL_EXECUTION_ROLE={:?}", execution.role).to_ascii_lowercase(),
             "--env".to_string(),
+            "KBCTL_TRANSPORT=herdr".to_string(),
+            "--env".to_string(),
             format!(
                 "{}={}",
                 report_spool::SUBMISSION_FILE_ENV,
@@ -456,24 +458,19 @@ impl AgentRuntime for HerdrRuntime {
     async fn read_recent(&self, runtime_id: &str, lines: usize) -> Result<String, KbctlError> {
         let runtime: RuntimeExecution = serde_json::from_str(runtime_id)
             .map_err(|error| KbctlError::Runtime(format!("invalid Herdr runtime id: {error}")))?;
-        let value = self
-            .command(&[
+        run_text(
+            &self.binary,
+            &[
                 "agent".to_string(),
                 "read".to_string(),
-                runtime.agent_name,
+                runtime.pane_id,
                 "--source".to_string(),
                 "recent-unwrapped".to_string(),
                 "--lines".to_string(),
                 lines.max(1).to_string(),
-            ])
-            .await?;
-        Ok(value
-            .get("result")
-            .and_then(|result| result.get("output").or_else(|| result.get("text")))
-            .or_else(|| value.get("output").or_else(|| value.get("text")))
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string())
+            ],
+        )
+        .await
     }
 
     async fn focus(&self, runtime_id: &str) -> Result<(), KbctlError> {
@@ -623,9 +620,6 @@ fn agent_arguments(contract: &WorkContract) -> Vec<String> {
                 }
                 .to_string(),
             ]);
-            if let Some(parent) = std::path::Path::new(&contract.submission_path).parent() {
-                args.extend(["--add-dir".to_string(), parent.display().to_string()]);
-            }
         }
         "opencode" => {
             args.push("--".to_string());
@@ -663,6 +657,24 @@ async fn run_json(binary: &PathBuf, args: &[String]) -> Result<Value, KbctlError
         .await
         .map_err(|error| KbctlError::Runtime(format!("run {}: {error}", binary.display())))?;
     parse_output(output.status.success(), &output.stdout, &output.stderr)
+}
+
+async fn run_text(binary: &PathBuf, args: &[String]) -> Result<String, KbctlError> {
+    let output = TokioCommand::new(binary)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .map_err(|error| KbctlError::Runtime(format!("run {}: {error}", binary.display())))?;
+    if !output.status.success() {
+        return Err(KbctlError::Runtime(error_message(
+            &Value::Null,
+            &output.stderr,
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
 pub(crate) fn run_sync_json<S>(binary: &str, args: &[S]) -> Result<Value, KbctlError>

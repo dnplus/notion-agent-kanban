@@ -418,13 +418,13 @@ impl WorkContract {
     pub fn prompt(&self) -> String {
         let report = match self.role {
             ExecutionRole::Supervisor => {
-                "這是新一輪 triage，不是 review。無論正文是否包含舊 execution、舊回報或歷史結論，本輪只能提交 Plan envelope，禁止提交 Review envelope。若需求不足，Plan 仍須建立一個 low-risk read step，用來整理缺漏與產生可供人工補充的問題。只能用 kbctl report submit --execution <id> --manifest <file> 提交 {\"type\":\"plan\",\"plan\":{\"parent_task_id\":\"...\",\"version\":1,\"summary\":\"...\",\"steps\":[{\"id\":\"step-1\",\"title\":\"...\",\"objective\":\"...\",\"depends_on\":[],\"profile\":\"fast_worker\",\"risk\":\"low\",\"mode\":\"read\",\"write_scope\":[],\"acceptance\":[\"...\"]}]}}。不要直接啟動 Worker、修改專案或改 Notion 狀態。"
+                "這是新一輪 triage，不是 review。無論正文是否包含舊 execution、舊回報或歷史結論，本輪只能回傳 Plan envelope，禁止回傳 Review envelope。若需求不足，Plan 仍須建立一個 low-risk read step，用來整理缺漏與產生可供人工補充的問題。Plan 格式為 {\"type\":\"plan\",\"plan\":{\"parent_task_id\":\"...\",\"version\":1,\"summary\":\"...\",\"steps\":[{\"id\":\"step-1\",\"title\":\"...\",\"objective\":\"...\",\"depends_on\":[],\"profile\":\"fast_worker\",\"risk\":\"low\",\"mode\":\"read\",\"write_scope\":[],\"acceptance\":[\"...\"]}]}}。不要直接啟動 Worker、修改專案或改 Notion 狀態。"
             }
             ExecutionRole::Reviewer => {
-                "這是明確指定 target 的 review 回合，本輪只能提交 Review envelope，禁止提交 Plan envelope。只能用 kbctl report submit --execution <id> --manifest <file> 提交 {\"type\":\"review\",\"review\":{\"target_id\":\"...\",\"decision\":\"accept\",\"summary\":\"...\",\"review_round\":1,\"findings\":[]}}。不要直接啟動 Worker、修改專案或改 Notion 狀態。"
+                "這是明確指定 target 的 review 回合，本輪只能回傳 Review envelope，禁止回傳 Plan envelope。Review 格式為 {\"type\":\"review\",\"review\":{\"target_id\":\"...\",\"decision\":\"accept\",\"summary\":\"...\",\"review_round\":1,\"findings\":[]}}。不要直接啟動 Worker、修改專案或改 Notion 狀態。"
             }
             ExecutionRole::Worker => {
-                "完成工作後，必須用 kbctl report submit --execution <id> --manifest <file> 提交 {\"type\":\"completion\",\"completion\":{\"work_item_id\":\"...\",\"summary\":\"...\",\"head_commit\":\"...或null\",\"artifacts\":[],\"known_issues\":[]}}。寫入工作必須先 commit。不要自行合併或修改 Notion 狀態。"
+                "完成工作後回傳 Completion envelope，格式為 {\"type\":\"completion\",\"completion\":{\"work_item_id\":\"...\",\"summary\":\"...\",\"head_commit\":\"...或null\",\"artifacts\":[],\"known_issues\":[]}}。寫入工作必須先 commit。不要自行合併或修改 Notion 狀態。"
             }
             ExecutionRole::Standalone => match self.mode {
                 ExecutionMode::Triage => {
@@ -436,7 +436,7 @@ impl WorkContract {
             },
         };
         format!(
-            "你正在處理 kbctl work contract。\nTask ID: {}\nExecution ID: {}\nRole: {:?}\nPlan version: {}\nWork item: {}\nMode: {}\nTitle: {}\nProject: {}\nWorking directory: {}\nDue: {}\nScheduled at: {}\n\n需求正文：\n{}\n\n{}\nManifest 可寫到系統暫存目錄後立即提交；不要把 manifest 加進專案。\n不要自行把 Notion Task 標成 done；business status 由 kbctl 驗證後寫回。",
+            "你正在處理 kbctl work contract。\nTask ID: {}\nExecution ID: {}\nRole: {:?}\nPlan version: {}\nWork item: {}\nMode: {}\nTitle: {}\nProject: {}\nWorking directory: {}\nDue: {}\nScheduled at: {}\n\n需求正文：\n{}\n\n{}\n{}\n不要自行把 Notion Task 標成 done；business status 由 kbctl 驗證後寫回。",
             self.task_id,
             self.execution_id,
             self.role,
@@ -456,6 +456,11 @@ impl WorkContract {
                 .unwrap_or_else(|| "none".to_string()),
             self.body,
             report,
+            if self.role == ExecutionRole::Standalone {
+                String::new()
+            } else {
+                crate::orchestration::runtime_envelope_instruction()
+            },
         )
     }
 }
