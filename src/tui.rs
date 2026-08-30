@@ -138,7 +138,6 @@ impl ContextMenu {
 
 #[derive(Debug, Clone, Copy)]
 struct BoardRegions {
-    header: Rect,
     body: Rect,
     details: Rect,
     keys: Rect,
@@ -146,6 +145,7 @@ struct BoardRegions {
 }
 
 struct BoardView<'a> {
+    config: &'a Config,
     store: &'a Store,
     tasks: &'a [Task],
     selected: usize,
@@ -156,22 +156,22 @@ struct BoardView<'a> {
 }
 
 fn board_regions(area: Rect) -> BoardRegions {
+    let preferred_details = if is_compact(area.width) { 14 } else { 8 };
+    let details_height = preferred_details.min(area.height.saturating_sub(6)).max(4);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),
             Constraint::Min(1),
-            Constraint::Length(6),
+            Constraint::Length(details_height),
             Constraint::Length(1),
             Constraint::Length(1),
         ])
         .split(area);
     BoardRegions {
-        header: chunks[0],
-        body: chunks[1],
-        details: chunks[2],
-        keys: chunks[3],
-        message: chunks[4],
+        body: chunks[0],
+        details: chunks[1],
+        keys: chunks[2],
+        message: chunks[3],
     }
 }
 
@@ -354,6 +354,7 @@ async fn board_loop(
         selected = selected.min(tasks.len().saturating_sub(1));
         draw(
             BoardView {
+                config,
                 store,
                 tasks,
                 selected,
@@ -969,6 +970,7 @@ fn draw(
 
 fn render_board(frame: &mut Frame, view: &BoardView<'_>) {
     let BoardView {
+        config,
         store,
         tasks,
         selected,
@@ -980,23 +982,6 @@ fn render_board(frame: &mut Frame, view: &BoardView<'_>) {
     let area = frame.area();
     let regions = board_regions(area);
     let compact = is_compact(area.width);
-    let header = if area.width < 48 {
-        "kbctl · click menu · q quit"
-    } else if area.width < 72 {
-        "kbctl · click menu · right-click Herdr · q quit"
-    } else if compact {
-        "kbctl board · cache · click menu · right-click Herdr · q quit"
-    } else {
-        "kbctl board · local cache · click menu · right-click Herdr · q quit"
-    };
-    frame.render_widget(
-        Paragraph::new(fit_cells(header, area.width as usize)).style(
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        regions.header,
-    );
     if compact {
         render_compact(frame, tasks, *selected, regions.body);
     } else {
@@ -1004,7 +989,7 @@ fn render_board(frame: &mut Frame, view: &BoardView<'_>) {
     }
     let details = tasks
         .get(*selected)
-        .map(|task| task_detail_lines(store, task, area.width as usize))
+        .map(|task| task_detail_lines(config, store, task))
         .unwrap_or_else(|| vec![Line::from(" selected: none")]);
     frame.render_widget(
         Paragraph::new(details)
@@ -1164,23 +1149,24 @@ fn single_line(value: &str) -> String {
     value.lines().collect::<Vec<_>>().join(" ")
 }
 
-fn task_detail_lines(store: &Store, task: &Task, width: usize) -> Vec<Line<'static>> {
+fn task_detail_lines(config: &Config, store: &Store, task: &Task) -> Vec<Line<'static>> {
+    let project_name = config
+        .project_binding(task.project_id.as_deref())
+        .map(|binding| binding.name.as_str())
+        .unwrap_or("unbound");
     let mut lines = vec![
         format!(" task: {}", single_line(&task.name)),
-        format!(
-            " status: {} · agent: {}",
-            task.status,
-            task.agent.as_deref().unwrap_or("default")
-        ),
-        format!(
-            " project: {} · sched: {}",
-            compact_identifier(task.project_id.as_deref()),
-            compact_timestamp(task.scheduled_at)
-        ),
+        format!(" status: {}", task.status),
+        format!(" agent: {}", task.agent.as_deref().unwrap_or("default")),
+        format!(" project: {project_name}"),
+        format!(" scheduled: {}", compact_timestamp(task.scheduled_at)),
         format!(" due: {}", compact_timestamp(task.due)),
         format!(
-            " exec: {} · result: {}",
-            compact_identifier(task.execution_id.as_deref()),
+            " execution: {}",
+            compact_identifier(task.execution_id.as_deref())
+        ),
+        format!(
+            " result: {}",
             task.result
                 .as_deref()
                 .map(single_line)
@@ -1190,7 +1176,6 @@ fn task_detail_lines(store: &Store, task: &Task, width: usize) -> Vec<Line<'stat
     if let Ok(Some(plan)) = store.latest_plan(&task.id)
         && let Ok(items) = store.work_items(&task.id, plan.version)
     {
-        lines.truncate(1);
         lines.push(format!(
             " plan v{}: {}",
             plan.version,
@@ -1214,7 +1199,7 @@ fn task_detail_lines(store: &Store, task: &Task, width: usize) -> Vec<Line<'stat
             } else {
                 Style::default()
             };
-            Line::from(Span::styled(fit_cells(&line, width), style))
+            Line::from(Span::styled(line, style))
         })
         .collect()
 }
@@ -1349,9 +1334,9 @@ mod tests {
             task("backlog item", TaskStatus::Backlog),
             task("ready item", TaskStatus::Ready),
         ];
-        assert_eq!(task_at(&tasks, 0, 80, 30, 2, 3), Some(0));
-        assert_eq!(task_at(&tasks, 0, 80, 30, 2, 7), Some(1));
-        assert_eq!(task_at(&tasks, 0, 80, 30, 2, 4), None);
+        assert_eq!(task_at(&tasks, 0, 80, 30, 2, 2), Some(0));
+        assert_eq!(task_at(&tasks, 0, 80, 30, 2, 6), Some(1));
+        assert_eq!(task_at(&tasks, 0, 80, 30, 2, 3), None);
         assert_eq!(
             compact_rows(&tasks).len(),
             BOARD_STATUSES.len() + tasks.len()
@@ -1455,9 +1440,40 @@ mod tests {
     }
 
     #[test]
+    fn task_details_use_project_name_and_one_field_per_line() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path().join("state.db")).unwrap();
+        let mut config = Config::default();
+        config.project.default = Some(crate::config::LocalProjectBinding {
+            id: "project-id".to_string(),
+            name: "Default Project".to_string(),
+            path: directory.path().display().to_string(),
+            default_agent: "codex".to_string(),
+            active: true,
+            checks: Vec::new(),
+            check_timeout_seconds: 900,
+        });
+        let details = task_detail_lines(&config, &store, &task("task", TaskStatus::Ready));
+        let text = details
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        assert!(text.iter().any(|line| line == " project: Default Project"));
+        assert!(text.iter().any(|line| line == " status: ready"));
+        assert!(text.iter().any(|line| line == " agent: default"));
+        assert!(!text.iter().any(|line| line.contains(" · ")));
+    }
+
+    #[test]
     fn compact_render_uses_bounded_terminal_cells() {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(directory.path().join("state.db")).unwrap();
+        let config = Config::default();
         let backend = TestBackend::new(36, 14);
         let mut terminal = Terminal::new(backend).expect("test terminal");
         let tasks = vec![Task {
@@ -1471,6 +1487,7 @@ mod tests {
                 render_board(
                     frame,
                     &BoardView {
+                        config: &config,
                         store: &store,
                         tasks: &tasks,
                         selected: 0,
@@ -1500,8 +1517,8 @@ mod tests {
             task("backlog item", TaskStatus::Backlog),
             task("ready item", TaskStatus::Ready),
         ];
-        assert_eq!(task_at(&tasks, 0, 160, 20, 2, 2), Some(0));
-        assert_eq!(task_at(&tasks, 0, 160, 20, 62, 2), Some(1));
-        assert_eq!(task_at(&tasks, 0, 160, 20, 22, 2), None);
+        assert_eq!(task_at(&tasks, 0, 160, 20, 2, 1), Some(0));
+        assert_eq!(task_at(&tasks, 0, 160, 20, 62, 1), Some(1));
+        assert_eq!(task_at(&tasks, 0, 160, 20, 22, 1), None);
     }
 }
