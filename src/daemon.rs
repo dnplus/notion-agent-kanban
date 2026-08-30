@@ -636,6 +636,9 @@ impl Daemon {
         let Some(mut run) = self.store.orchestration_run(&task.id)? else {
             return Ok(0);
         };
+        if task.status == TaskStatus::Done {
+            return Ok(0);
+        }
         if matches!(task.status, TaskStatus::Cancel | TaskStatus::Archived) {
             run.state = PlanState::Cancelled;
             run.updated_at = Utc::now();
@@ -1685,6 +1688,83 @@ mod tests {
         let task = provider.tasks.lock().unwrap()[0].clone();
         assert_eq!(task.status, TaskStatus::Done);
         assert_eq!(task.result.as_deref(), Some("integrated final result"));
+    }
+
+    #[tokio::test]
+    async fn completed_parent_is_not_reopened_by_stale_orchestration() {
+        let directory = tempfile::tempdir().unwrap();
+        let provider = FakeProvider {
+            tasks: Arc::new(Mutex::new(vec![task(
+                TaskStatus::Done,
+                Some(Utc::now() + ChronoDuration::hours(1)),
+            )])),
+            appended: Arc::new(Mutex::new(Vec::new())),
+        };
+        let store = Store::open(directory.path().join("state.db")).unwrap();
+        let step = crate::domain::PlanStep {
+            id: "step-1".to_string(),
+            title: "Research".to_string(),
+            objective: "Inspect the project".to_string(),
+            depends_on: Vec::new(),
+            profile: "fast_worker".to_string(),
+            risk: crate::domain::RiskLevel::Low,
+            mode: WorkMode::Read,
+            write_scope: Vec::new(),
+            acceptance: vec!["findings".to_string()],
+        };
+        store
+            .save_plan(&PlanDag {
+                parent_task_id: "task-1".to_string(),
+                version: 1,
+                summary: "stale plan".to_string(),
+                steps: vec![step.clone()],
+            })
+            .unwrap();
+        store
+            .save_work_item(&WorkItem {
+                id: "task-1:1:step-1".to_string(),
+                parent_task_id: "task-1".to_string(),
+                plan_version: 1,
+                step,
+                state: WorkItemState::Merged,
+                attempt: 1,
+                execution_id: None,
+                branch: None,
+                checkout_path: None,
+                summary: Some("finished".to_string()),
+                head_commit: None,
+                review_round: 1,
+            })
+            .unwrap();
+        store
+            .save_orchestration_run(&OrchestrationRun {
+                parent_task_id: "task-1".to_string(),
+                plan_version: 1,
+                state: PlanState::Executing,
+                supervisor_execution_id: None,
+                approved_plan_version: Some(1),
+                base_commit: None,
+                base_branch: None,
+                integration_branch: None,
+                updated_at: Utc::now(),
+            })
+            .unwrap();
+        let daemon = Daemon::new(
+            config(directory.path().to_str().unwrap()),
+            Arc::new(provider.clone()),
+            Arc::new(FakeRuntime {
+                state: Arc::new(Mutex::new(RuntimeState::Done)),
+            }),
+            store.clone(),
+        );
+
+        daemon.run_once().await.unwrap();
+
+        assert_eq!(provider.tasks.lock().unwrap()[0].status, TaskStatus::Done);
+        assert_eq!(
+            store.orchestration_run("task-1").unwrap().unwrap().state,
+            PlanState::Executing
+        );
     }
 
     #[tokio::test]
