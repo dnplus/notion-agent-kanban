@@ -17,6 +17,7 @@ use anyhow::Result;
 use chrono::Utc;
 use clap::{Args, Parser, Subcommand};
 use std::{
+    io::Read,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -168,7 +169,8 @@ pub async fn run() -> Result<()> {
         .try_init();
     let cli = Cli::parse();
     let config_path = cli.config.as_deref();
-    let config = if report_spool::configured_path().is_some()
+    let config = if (report_spool::configured_path().is_some()
+        || report_spool::configured_submission_path().is_some())
         && matches!(&cli.command, Command::Report { .. })
     {
         Config::default()
@@ -578,12 +580,22 @@ async fn finish_task(config: Config, task_id: String) -> Result<()> {
 }
 
 async fn submit_manifest(config: Config, args: SubmitArgs) -> Result<()> {
-    let encoded = std::fs::read_to_string(&args.manifest).map_err(|error| {
-        KbctlError::Validation(format!(
-            "read manifest {}: {error}",
-            args.manifest.display()
-        ))
-    })?;
+    let encoded = if args.manifest == Path::new("-") {
+        let mut encoded = String::new();
+        std::io::stdin()
+            .read_to_string(&mut encoded)
+            .map_err(|error| {
+                KbctlError::Validation(format!("read manifest from stdin: {error}"))
+            })?;
+        encoded
+    } else {
+        std::fs::read_to_string(&args.manifest).map_err(|error| {
+            KbctlError::Validation(format!(
+                "read manifest {}: {error}",
+                args.manifest.display()
+            ))
+        })?
+    };
     let envelope: SubmissionEnvelope = serde_json::from_str(&encoded)
         .map_err(|error| KbctlError::Validation(format!("invalid manifest: {error}")))?;
     if let Some(path) = report_spool::configured_submission_path() {

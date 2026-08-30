@@ -168,9 +168,7 @@ description: Submit a kbctl work contract result. Use when KBCTL_EXECUTION_ID is
 
 Keep `KBCTL_EXECUTION_ID` and `KBCTL_TASK_ID` from the environment. kbctl validates the report and writes business status back to Notion.
 
-When `KBCTL_TRANSPORT` is `herdr` and `KBCTL_EXECUTION_ROLE` is `supervisor`, `reviewer`, or `worker`, do not run `kbctl report` and do not write a manifest. Serialize the envelope as JSON, encode those exact JSON bytes with standard Base64, and return that text between the exact `KBCTL_ENVELOPE_BEGIN` and `KBCTL_ENVELOPE_END` marker lines required by the work contract. Line wrapping inside the Base64 payload is allowed. Supervisors return Plan and Review envelopes. Workers return Completion envelopes and must commit write work before returning a successful write result.
-
-Outside Herdr, `kbctl report submit --execution "$KBCTL_EXECUTION_ID" --manifest <file>` remains available for a manually managed Supervisor, Reviewer, or Worker.
+For a Supervisor, Reviewer, or Worker, serialize the requested envelope as JSON and send it through stdin with `kbctl report submit --execution "$KBCTL_EXECUTION_ID" --manifest -`. The command writes a project-local `.kbctl` submission spool for the daemon to validate. Do not update SQLite or Notion directly. Workers must commit write work before submitting a successful Completion envelope.
 
 For standalone contracts:
 
@@ -178,7 +176,7 @@ For standalone contracts:
 - Human review: `kbctl report review --summary "what needs review"`
 - Cannot continue: `kbctl report blocked --reason "the blocking condition"`
 
-In a Herdr work contract, Herdr transports the final response and lifecycle events. The daemon reads and validates the marked envelope, then owns SQLite and Notion writeback. If the process settles without a valid envelope, the daemon retries up to its attempt limit, then sends the task to review.
+Herdr owns the agent process and lifecycle events. `kbctl report submit` owns result transport, and the daemon owns validation, SQLite, and Notion writeback. If the process settles without a valid submission, the daemon retries up to its attempt limit, then sends the task to review.
 "#;
 
 #[cfg(test)]

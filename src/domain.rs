@@ -491,7 +491,7 @@ impl WorkContract {
             if self.role == ExecutionRole::Standalone {
                 String::new()
             } else {
-                crate::orchestration::runtime_envelope_instruction()
+                crate::orchestration::submission_instruction(&self.execution_id)
             },
         )
     }

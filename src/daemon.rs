@@ -274,13 +274,8 @@ impl Daemon {
         running_task.execution_id = Some(execution.id.clone());
         self.store.cache_task(&running_task)?;
         let contract_path = binding.path.clone();
-        let submission_path = if execution.role == ExecutionRole::Supervisor {
-            std::env::temp_dir()
-                .join("kbctl/submissions")
-                .join(format!("{}.json", execution.id))
-        } else {
-            report_spool::submission_path_for(Path::new(&contract_path), &execution.id)
-        };
+        let submission_path =
+            report_spool::submission_path_for(Path::new(&contract_path), &execution.id);
         execution.checkout_path = Some(contract_path.clone());
         execution.submission_path = Some(submission_path.display().to_string());
         if let Some(parent) = submission_path.parent() {
@@ -308,7 +303,7 @@ impl Daemon {
             model: profile.model,
             reasoning: profile.reasoning,
             agent: profile.agent,
-            read_only: execution.role == ExecutionRole::Supervisor,
+            read_only: false,
             plan_version: execution.plan_version,
             work_item_id: None,
             submission_path: submission_path.display().to_string(),
@@ -437,18 +432,6 @@ impl Daemon {
                 continue;
             }
             if execution.role != ExecutionRole::Standalone {
-                if matches!(state, RuntimeState::Done | RuntimeState::Idle) {
-                    match self.ingest_runtime_submission(&execution).await {
-                        Ok(true) => {
-                            reconciled_tasks.insert(execution.task_id.clone());
-                            continue;
-                        }
-                        Ok(false) => {}
-                        Err(error) => {
-                            tracing::warn!(execution_id = %execution.id, error = %error, "Herdr output submission could not be ingested")
-                        }
-                    }
-                }
                 self.retry_or_block_orchestration(&task, &execution).await?;
                 reconciled_tasks.insert(execution.task_id);
                 continue;
@@ -585,28 +568,6 @@ impl Daemon {
         self.store
             .mark_execution_state(&execution.id, "submitted")?;
         Ok(true)
-    }
-
-    async fn ingest_runtime_submission(&self, execution: &Execution) -> Result<bool, KbctlError> {
-        let runtime_id = execution.runtime_id.as_deref().ok_or_else(|| {
-            KbctlError::State(format!("execution {} has no runtime id", execution.id))
-        })?;
-        let output = self.runtime.read_recent(runtime_id, 1_000).await?;
-        for envelope in orchestration::runtime_envelopes(&output).into_iter().rev() {
-            let key = Store::submission_key(&envelope);
-            if self
-                .store
-                .submission_by_key(&execution.id, &key)?
-                .is_some_and(|existing| existing == envelope)
-            {
-                continue;
-            }
-            orchestration::apply_submission(&self.config, &self.store, &execution.id, &envelope)?;
-            self.store
-                .mark_execution_state(&execution.id, "submitted")?;
-            return Ok(true);
-        }
-        Ok(false)
     }
 
     async fn retry_or_block_orchestration(
@@ -1010,7 +971,7 @@ impl Daemon {
             model: profile.model,
             reasoning: profile.reasoning,
             agent: profile.agent,
-            read_only: item.step.mode == WorkMode::Read,
+            read_only: false,
             plan_version: Some(run.plan_version),
             work_item_id: Some(item.id.clone()),
             submission_path: submission_path.display().to_string(),
@@ -1056,7 +1017,7 @@ impl Daemon {
             item.head_commit.as_deref().unwrap_or("none"),
             item.id,
             item.review_round.saturating_add(1),
-            orchestration::runtime_envelope_instruction()
+            orchestration::submission_instruction(execution_id)
         );
         self.store.mark_execution_state(execution_id, "running")?;
         self.runtime.prompt(runtime_id, &prompt).await?;
@@ -1099,7 +1060,7 @@ impl Daemon {
                     run.parent_task_id,
                     summaries,
                     run.parent_task_id,
-                    orchestration::runtime_envelope_instruction()
+                    orchestration::submission_instruction(execution_id)
                 ),
             )
             .await?;
@@ -1360,7 +1321,6 @@ mod tests {
         notion::ProjectUpdate,
     };
     use async_trait::async_trait;
-    use base64::{Engine, engine::general_purpose::STANDARD};
     use chrono::{Duration as ChronoDuration, Utc};
     use std::sync::{Arc, Mutex};
 
@@ -1483,12 +1443,6 @@ mod tests {
         body: Arc<Mutex<Option<String>>>,
     }
 
-    #[derive(Clone)]
-    struct OutputRuntime {
-        state: Arc<Mutex<RuntimeState>>,
-        output: Arc<Mutex<String>>,
-    }
-
     #[async_trait]
     impl AgentRuntime for FakeRuntime {
         async fn start(
@@ -1526,39 +1480,6 @@ mod tests {
 
         async fn inspect(&self, _runtime_id: &str) -> Result<RuntimeState, KbctlError> {
             Ok(*self.state.lock().unwrap())
-        }
-
-        async fn focus(&self, _runtime_id: &str) -> Result<(), KbctlError> {
-            Ok(())
-        }
-
-        async fn cancel(&self, _runtime_id: &str) -> Result<(), KbctlError> {
-            *self.state.lock().unwrap() = RuntimeState::Done;
-            Ok(())
-        }
-    }
-
-    #[async_trait]
-    impl AgentRuntime for OutputRuntime {
-        async fn start(
-            &self,
-            _execution: &Execution,
-            _contract: &WorkContract,
-        ) -> Result<String, KbctlError> {
-            *self.state.lock().unwrap() = RuntimeState::Working;
-            Ok("output-runtime".to_string())
-        }
-
-        async fn inspect(&self, _runtime_id: &str) -> Result<RuntimeState, KbctlError> {
-            Ok(*self.state.lock().unwrap())
-        }
-
-        async fn read_recent(
-            &self,
-            _runtime_id: &str,
-            _lines: usize,
-        ) -> Result<String, KbctlError> {
-            Ok(self.output.lock().unwrap().clone())
         }
 
         async fn focus(&self, _runtime_id: &str) -> Result<(), KbctlError> {
@@ -1800,7 +1721,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ingests_orchestration_envelope_from_settled_herdr_output() {
+    async fn ingests_orchestration_submission_from_project_spool() {
         let directory = tempfile::tempdir().unwrap();
         let provider = FakeProvider {
             tasks: Arc::new(Mutex::new(vec![task(
@@ -1810,35 +1731,49 @@ mod tests {
             appended: Arc::new(Mutex::new(Vec::new())),
         };
         let state = Arc::new(Mutex::new(RuntimeState::Working));
-        let output = Arc::new(Mutex::new(String::new()));
         let store = Store::open(directory.path().join("state.db")).unwrap();
         let mut daemon_config = config(directory.path().to_str().unwrap());
         daemon_config.ensure_default_profiles();
         let daemon = Daemon::new(
             daemon_config,
             Arc::new(provider),
-            Arc::new(OutputRuntime {
-                state: state.clone(),
-                output: output.clone(),
-            }),
+            Arc::new(FakeRuntime { state }),
             store.clone(),
         );
 
         assert_eq!(daemon.run_once().await.unwrap().dispatched, 1);
         let run = store.orchestration_run("task-1").unwrap().unwrap();
         let supervisor = run.supervisor_execution_id.unwrap();
-        let envelope = STANDARD.encode(
-            "{\"type\":\"plan\",\"plan\":{\"parent_task_id\":\"task-1\",\"version\":1,\"summary\":\"two reads\",\"steps\":[{\"id\":\"read-1\",\"title\":\"Read\",\"objective\":\"Research\",\"depends_on\":[],\"profile\":\"fast_worker\",\"risk\":\"low\",\"mode\":\"read\",\"write_scope\":[],\"acceptance\":[\"sources\"]}]}}",
-        );
-        *output.lock().unwrap() = format!(
-            "{}\n{}\n{}",
-            orchestration::ENVELOPE_BEGIN,
-            envelope,
-            orchestration::ENVELOPE_END
-        );
-        *state.lock().unwrap() = RuntimeState::Idle;
+        let execution = store.execution(&supervisor).unwrap().unwrap();
+        let path = PathBuf::from(execution.submission_path.unwrap());
+        report_spool::write_submission(
+            &path,
+            &report_spool::AgentSubmission {
+                execution_id: supervisor.clone(),
+                envelope: SubmissionEnvelope::Plan {
+                    plan: PlanDag {
+                        parent_task_id: "task-1".to_string(),
+                        version: 1,
+                        summary: "two reads".to_string(),
+                        steps: vec![crate::domain::PlanStep {
+                            id: "read-1".to_string(),
+                            title: "Read".to_string(),
+                            objective: "Research".to_string(),
+                            depends_on: Vec::new(),
+                            profile: "fast_worker".to_string(),
+                            risk: crate::domain::RiskLevel::Low,
+                            mode: WorkMode::Read,
+                            write_scope: Vec::new(),
+                            acceptance: vec!["sources".to_string()],
+                        }],
+                    },
+                },
+            },
+        )
+        .unwrap();
 
         assert_eq!(daemon.run_once().await.unwrap().reconciled, 1);
+        assert!(!path.exists());
         assert_eq!(
             store.latest_plan("task-1").unwrap().unwrap().summary,
             "two reads"
