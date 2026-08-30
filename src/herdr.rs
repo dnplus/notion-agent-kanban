@@ -707,6 +707,9 @@ fn agent_arguments(contract: &WorkContract) -> Vec<String> {
                     format!("model_reasoning_effort=\"{reasoning}\""),
                 ]);
             }
+            if contract.role == crate::domain::ExecutionRole::Worker {
+                args.extend(["--disable".to_string(), "multi_agent".to_string()]);
+            }
             args.extend([
                 "--sandbox".to_string(),
                 if contract.read_only {
@@ -1166,6 +1169,15 @@ mod tests {
                 "Worker · Compare clients",
                 "--no-focus"
             ]
+        );
+    }
+
+    #[test]
+    fn codex_worker_cannot_spawn_hidden_subagents() {
+        let args = agent_arguments(&contract(Some("w1")));
+        assert!(
+            args.windows(2)
+                .any(|values| values == ["--disable", "multi_agent"])
         );
     }
 
