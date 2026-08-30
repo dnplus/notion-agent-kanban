@@ -236,6 +236,13 @@ mod tests {
                 runtime_id: None,
                 attempt: 1,
                 retry_at: None,
+                role: Default::default(),
+                parent_task_id: None,
+                work_item_id: None,
+                plan_version: None,
+                checkout_path: None,
+                branch: None,
+                submission_path: None,
             }),
             runtime: Some(runtime),
         };

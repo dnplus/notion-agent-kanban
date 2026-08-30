@@ -7,11 +7,14 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
+    collections::HashSet,
     ffi::OsStr,
     path::PathBuf,
     process::{Command as SyncCommand, Stdio},
+    sync::{Arc, Mutex},
 };
 use tokio::process::Command as TokioCommand;
+use tokio::sync::broadcast;
 use tokio::time::{Duration, sleep};
 
 const HERDR_INTERRUPT_KEY: &str = "ctrl+c";
@@ -24,6 +27,14 @@ pub enum RuntimeState {
     Blocked,
     Done,
     Unknown,
+}
+
+#[derive(Debug, Clone)]
+pub struct RuntimeEvent {
+    pub event_id: String,
+    pub pane_id: String,
+    pub state: RuntimeState,
+    pub payload: Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,30 +57,121 @@ pub(crate) struct BoardPaneContext<'a> {
 
 #[async_trait]
 pub trait AgentRuntime: Send + Sync {
+    async fn ensure(
+        &self,
+        execution: &Execution,
+        contract: &WorkContract,
+    ) -> Result<String, KbctlError> {
+        self.start(execution, contract).await
+    }
     async fn start(
         &self,
         execution: &Execution,
         contract: &WorkContract,
     ) -> Result<String, KbctlError>;
     async fn inspect(&self, runtime_id: &str) -> Result<RuntimeState, KbctlError>;
+    async fn prompt(&self, runtime_id: &str, prompt: &str) -> Result<(), KbctlError> {
+        let _ = (runtime_id, prompt);
+        Err(KbctlError::Runtime(
+            "runtime prompt is not supported".to_string(),
+        ))
+    }
+    async fn read_recent(&self, runtime_id: &str, lines: usize) -> Result<String, KbctlError> {
+        let _ = (runtime_id, lines);
+        Err(KbctlError::Runtime(
+            "runtime output reading is not supported".to_string(),
+        ))
+    }
     async fn focus(&self, runtime_id: &str) -> Result<(), KbctlError>;
     async fn cancel(&self, runtime_id: &str) -> Result<(), KbctlError>;
+    fn watch(&self, runtime_id: &str) -> Result<(), KbctlError> {
+        let _ = runtime_id;
+        Ok(())
+    }
+    fn subscribe(&self) -> Option<broadcast::Receiver<RuntimeEvent>> {
+        None
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct HerdrRuntime {
     binary: PathBuf,
+    events: broadcast::Sender<RuntimeEvent>,
+    watched_panes: Arc<Mutex<HashSet<String>>>,
 }
 
 impl HerdrRuntime {
     pub fn new(binary: impl Into<PathBuf>) -> Self {
+        let (events, _) = broadcast::channel(256);
         Self {
             binary: binary.into(),
+            events,
+            watched_panes: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
     pub async fn status(&self) -> Result<Value, KbctlError> {
         run_json(&self.binary, &["api".to_string(), "snapshot".to_string()]).await
+    }
+
+    pub async fn version(&self) -> Result<String, KbctlError> {
+        let output = TokioCommand::new(&self.binary)
+            .arg("--version")
+            .output()
+            .await
+            .map_err(|error| KbctlError::Runtime(format!("run Herdr version: {error}")))?;
+        if !output.status.success() {
+            return Err(KbctlError::Runtime(
+                "Herdr version check failed".to_string(),
+            ));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    pub async fn open_integration_diff(
+        &self,
+        cwd: &str,
+        base_branch: &str,
+        integration_branch: &str,
+    ) -> Result<(), KbctlError> {
+        let target = std::env::var("HERDR_PANE_ID")
+            .map_err(|_| KbctlError::Runtime("board is not running in a Herdr pane".to_string()))?;
+        let split = self
+            .command(&[
+                "pane".to_string(),
+                "split".to_string(),
+                "--pane".to_string(),
+                target,
+                "--direction".to_string(),
+                "down".to_string(),
+                "--ratio".to_string(),
+                "0.45".to_string(),
+                "--cwd".to_string(),
+                cwd.to_string(),
+                "--focus".to_string(),
+            ])
+            .await?;
+        let pane_id = first_nested_string(
+            &split,
+            &[
+                &["pane_id"],
+                &["result", "pane", "pane_id"],
+                &["result", "pane_id"],
+            ],
+        )
+        .ok_or_else(|| KbctlError::Runtime("Herdr did not return the diff pane id".to_string()))?;
+        let range = format!("{base_branch}...{integration_branch}");
+        self.command(&[
+            "pane".to_string(),
+            "run".to_string(),
+            pane_id,
+            "git".to_string(),
+            "diff".to_string(),
+            "--color=always".to_string(),
+            range,
+        ])
+        .await?;
+        Ok(())
     }
 
     async fn command(&self, args: &[String]) -> Result<Value, KbctlError> {
@@ -190,6 +292,22 @@ impl HerdrRuntime {
             }
         }
     }
+
+    fn watch_runtime(&self, runtime: RuntimeExecution) {
+        if !self
+            .watched_panes
+            .lock()
+            .expect("watch set")
+            .insert(runtime.pane_id.clone())
+        {
+            return;
+        }
+        let sender = self.events.clone();
+        let pane_id = runtime.pane_id;
+        tokio::spawn(async move {
+            subscribe_to_pane_events(pane_id, sender).await;
+        });
+    }
 }
 
 #[async_trait]
@@ -221,6 +339,14 @@ impl AgentRuntime for HerdrRuntime {
             ),
             "--env".to_string(),
             format!("KBCTL_EXECUTION_MODE={}", execution.mode),
+            "--env".to_string(),
+            format!("KBCTL_EXECUTION_ROLE={:?}", execution.role).to_ascii_lowercase(),
+            "--env".to_string(),
+            format!(
+                "{}={}",
+                report_spool::SUBMISSION_FILE_ENV,
+                contract.submission_path
+            ),
         ];
         let workspace = self.command(&workspace_args).await?;
         let (workspace_id, tab_id, pane_id) = self.workspace_ids(&workspace)?;
@@ -244,6 +370,7 @@ impl AgentRuntime for HerdrRuntime {
             "--pane".to_string(),
             pane_id.clone(),
         ];
+        start_args.extend(agent_arguments(contract));
         let started = self.start_agent_with_retry(&start_args).await?;
         let started_name = first_nested_string(
             &started,
@@ -268,6 +395,7 @@ impl AgentRuntime for HerdrRuntime {
             agent_name: started_name,
             agent_kind: contract.agent_kind.clone(),
         };
+        self.watch_runtime(runtime.clone());
         serde_json::to_string(&runtime).map_err(|error| KbctlError::Runtime(error.to_string()))
     }
 
@@ -319,6 +447,35 @@ impl AgentRuntime for HerdrRuntime {
         .unwrap_or(RuntimeState::Unknown))
     }
 
+    async fn prompt(&self, runtime_id: &str, prompt: &str) -> Result<(), KbctlError> {
+        let runtime: RuntimeExecution = serde_json::from_str(runtime_id)
+            .map_err(|error| KbctlError::Runtime(format!("invalid Herdr runtime id: {error}")))?;
+        self.prompt_with_retry(&runtime.agent_name, prompt).await
+    }
+
+    async fn read_recent(&self, runtime_id: &str, lines: usize) -> Result<String, KbctlError> {
+        let runtime: RuntimeExecution = serde_json::from_str(runtime_id)
+            .map_err(|error| KbctlError::Runtime(format!("invalid Herdr runtime id: {error}")))?;
+        let value = self
+            .command(&[
+                "agent".to_string(),
+                "read".to_string(),
+                runtime.agent_name,
+                "--source".to_string(),
+                "recent-unwrapped".to_string(),
+                "--lines".to_string(),
+                lines.max(1).to_string(),
+            ])
+            .await?;
+        Ok(value
+            .get("result")
+            .and_then(|result| result.get("output").or_else(|| result.get("text")))
+            .or_else(|| value.get("output").or_else(|| value.get("text")))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string())
+    }
+
     async fn focus(&self, runtime_id: &str) -> Result<(), KbctlError> {
         let runtime: RuntimeExecution = serde_json::from_str(runtime_id)
             .map_err(|error| KbctlError::Runtime(format!("invalid Herdr runtime id: {error}")))?;
@@ -339,6 +496,161 @@ impl AgentRuntime for HerdrRuntime {
         .await
         .map(|_| ())
     }
+
+    fn watch(&self, runtime_id: &str) -> Result<(), KbctlError> {
+        let runtime: RuntimeExecution = serde_json::from_str(runtime_id)
+            .map_err(|error| KbctlError::Runtime(format!("invalid Herdr runtime id: {error}")))?;
+        self.watch_runtime(runtime);
+        Ok(())
+    }
+
+    fn subscribe(&self) -> Option<broadcast::Receiver<RuntimeEvent>> {
+        Some(self.events.subscribe())
+    }
+}
+
+#[cfg(unix)]
+async fn subscribe_to_pane_events(pane_id: String, sender: broadcast::Sender<RuntimeEvent>) {
+    use sha2::{Digest, Sha256};
+    use tokio::{
+        io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+        net::UnixStream,
+    };
+    loop {
+        let socket = std::env::var_os("HERDR_SOCKET_PATH")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .map(|home| PathBuf::from(home).join(".config/herdr/herdr.sock"))
+            });
+        let Some(socket) = socket else {
+            return;
+        };
+        match UnixStream::connect(&socket).await {
+            Ok(stream) => {
+                let (reader, mut writer) = stream.into_split();
+                let request = serde_json::json!({
+                    "id": format!("kbctl-{}", uuid::Uuid::new_v4()),
+                    "method": "events.subscribe",
+                    "params": {
+                        "subscriptions": [
+                            {"type": "pane.agent_status_changed", "pane_id": pane_id},
+                            {"type": "pane.exited", "pane_id": pane_id},
+                            {"type": "pane.agent_detected", "pane_id": pane_id}
+                        ]
+                    }
+                });
+                if writer
+                    .write_all(format!("{request}\n").as_bytes())
+                    .await
+                    .is_ok()
+                {
+                    let mut lines = BufReader::new(reader).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let Ok(payload) = serde_json::from_str::<Value>(&line) else {
+                            continue;
+                        };
+                        let Some(state) = runtime_state_from_event(&payload) else {
+                            continue;
+                        };
+                        let event_id = format!("{:x}", Sha256::digest(line.as_bytes()));
+                        let _ = sender.send(RuntimeEvent {
+                            event_id,
+                            pane_id: pane_id.clone(),
+                            state,
+                            payload,
+                        });
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, path = %socket.display(), "Herdr event subscription connect failed")
+            }
+        }
+        sleep(Duration::from_secs(2)).await;
+    }
+}
+
+#[cfg(not(unix))]
+async fn subscribe_to_pane_events(_pane_id: String, _sender: broadcast::Sender<RuntimeEvent>) {}
+
+fn runtime_state_from_event(value: &Value) -> Option<RuntimeState> {
+    if let Some(status) = find_string_key(value, "agent_status") {
+        return Some(match status {
+            "idle" => RuntimeState::Idle,
+            "working" => RuntimeState::Working,
+            "blocked" => RuntimeState::Blocked,
+            "done" => RuntimeState::Done,
+            _ => RuntimeState::Unknown,
+        });
+    }
+    let event_type = find_string_key(value, "type")?;
+    matches!(event_type, "pane_exited" | "pane.exited").then_some(RuntimeState::Done)
+}
+
+fn find_string_key<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
+    match value {
+        Value::Object(values) => values.get(key).and_then(Value::as_str).or_else(|| {
+            values
+                .values()
+                .find_map(|value| find_string_key(value, key))
+        }),
+        Value::Array(values) => values.iter().find_map(|value| find_string_key(value, key)),
+        _ => None,
+    }
+}
+
+fn agent_arguments(contract: &WorkContract) -> Vec<String> {
+    let mut args = Vec::new();
+    match contract.agent_kind.as_str() {
+        "codex" => {
+            args.push("--".to_string());
+            if let Some(model) = &contract.model {
+                args.extend(["--model".to_string(), model.clone()]);
+            }
+            if let Some(reasoning) = &contract.reasoning {
+                args.extend([
+                    "--config".to_string(),
+                    format!("model_reasoning_effort=\"{reasoning}\""),
+                ]);
+            }
+            args.extend([
+                "--sandbox".to_string(),
+                if contract.read_only {
+                    "read-only"
+                } else {
+                    "workspace-write"
+                }
+                .to_string(),
+            ]);
+            if let Some(parent) = std::path::Path::new(&contract.submission_path).parent() {
+                args.extend(["--add-dir".to_string(), parent.display().to_string()]);
+            }
+        }
+        "opencode" => {
+            args.push("--".to_string());
+            if let Some(model) = &contract.model {
+                args.extend(["--model".to_string(), model.clone()]);
+            }
+            if let Some(agent) = &contract.agent {
+                args.extend(["--agent".to_string(), agent.clone()]);
+            }
+        }
+        "grok" => {
+            args.push("--".to_string());
+            if let Some(model) = &contract.model {
+                args.extend(["--model".to_string(), model.clone()]);
+            }
+            if let Some(agent) = &contract.agent {
+                args.extend(["--agent".to_string(), agent.clone()]);
+            }
+            if contract.role == crate::domain::ExecutionRole::Worker {
+                args.push("--no-subagents".to_string());
+            }
+        }
+        _ => {}
+    }
+    args
 }
 
 async fn run_json(binary: &PathBuf, args: &[String]) -> Result<Value, KbctlError> {

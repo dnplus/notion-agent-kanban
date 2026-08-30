@@ -1,5 +1,5 @@
 use crate::{
-    domain::{Execution, Report, Task},
+    domain::{Execution, OrchestrationRun, PlanDag, Report, SubmissionEnvelope, Task, WorkItem},
     error::KbctlError,
 };
 use chrono::{DateTime, Utc};
@@ -91,6 +91,18 @@ impl Store {
                 serde_json::from_str(&value).map_err(|error| KbctlError::State(error.to_string()))
             })
             .transpose()
+    }
+
+    pub fn execution_state(&self, execution_id: &str) -> Result<Option<String>, KbctlError> {
+        let connection = self.connection()?;
+        connection
+            .query_row(
+                "SELECT state FROM executions WHERE id = ?1",
+                params![execution_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| KbctlError::State(error.to_string()))
     }
 
     pub fn execution_for_task(&self, task_id: &str) -> Result<Option<Execution>, KbctlError> {
@@ -398,6 +410,204 @@ impl Store {
         Ok(())
     }
 
+    pub fn save_orchestration_run(&self, run: &OrchestrationRun) -> Result<(), KbctlError> {
+        let connection = self.connection()?;
+        let encoded =
+            serde_json::to_string(run).map_err(|error| KbctlError::State(error.to_string()))?;
+        connection
+            .execute(
+                "INSERT INTO orchestration_runs (parent_task_id, run_json, updated_at) VALUES (?1, ?2, ?3) ON CONFLICT(parent_task_id) DO UPDATE SET run_json=excluded.run_json, updated_at=excluded.updated_at",
+                params![run.parent_task_id, encoded, run.updated_at.to_rfc3339()],
+            )
+            .map_err(|error| KbctlError::State(error.to_string()))?;
+        Ok(())
+    }
+
+    pub fn orchestration_run(
+        &self,
+        parent_task_id: &str,
+    ) -> Result<Option<OrchestrationRun>, KbctlError> {
+        self.read_json(
+            "SELECT run_json FROM orchestration_runs WHERE parent_task_id = ?1",
+            parent_task_id,
+        )
+    }
+
+    pub fn save_plan(&self, plan: &PlanDag) -> Result<(), KbctlError> {
+        let connection = self.connection()?;
+        let encoded =
+            serde_json::to_string(plan).map_err(|error| KbctlError::State(error.to_string()))?;
+        let transaction = connection
+            .unchecked_transaction()
+            .map_err(|error| KbctlError::State(error.to_string()))?;
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO plans (parent_task_id, version, plan_json) VALUES (?1, ?2, ?3)",
+                params![plan.parent_task_id, plan.version, encoded],
+            )
+            .map_err(|error| KbctlError::State(error.to_string()))?;
+        for step in plan.steps.iter().cloned() {
+            let item = WorkItem::from_step(&plan.parent_task_id, plan.version, step);
+            let item_json = serde_json::to_string(&item)
+                .map_err(|error| KbctlError::State(error.to_string()))?;
+            transaction
+                .execute(
+                    "INSERT OR IGNORE INTO work_items (id, parent_task_id, plan_version, state, item_json, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![item.id, item.parent_task_id, item.plan_version, format!("{:?}", item.state).to_ascii_lowercase(), item_json, Utc::now().to_rfc3339()],
+                )
+                .map_err(|error| KbctlError::State(error.to_string()))?;
+        }
+        transaction
+            .commit()
+            .map_err(|error| KbctlError::State(error.to_string()))?;
+        Ok(())
+    }
+
+    pub fn plan(&self, parent_task_id: &str, version: u32) -> Result<Option<PlanDag>, KbctlError> {
+        let connection = self.connection()?;
+        let encoded = connection
+            .query_row(
+                "SELECT plan_json FROM plans WHERE parent_task_id = ?1 AND version = ?2",
+                params![parent_task_id, version],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| KbctlError::State(error.to_string()))?;
+        decode_optional(encoded)
+    }
+
+    pub fn latest_plan(&self, parent_task_id: &str) -> Result<Option<PlanDag>, KbctlError> {
+        self.read_json(
+            "SELECT plan_json FROM plans WHERE parent_task_id = ?1 ORDER BY version DESC LIMIT 1",
+            parent_task_id,
+        )
+    }
+
+    pub fn save_work_item(&self, item: &WorkItem) -> Result<(), KbctlError> {
+        let connection = self.connection()?;
+        let encoded =
+            serde_json::to_string(item).map_err(|error| KbctlError::State(error.to_string()))?;
+        connection
+            .execute(
+                "INSERT INTO work_items (id, parent_task_id, plan_version, state, item_json, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(id) DO UPDATE SET state=excluded.state, item_json=excluded.item_json, updated_at=excluded.updated_at",
+                params![item.id, item.parent_task_id, item.plan_version, format!("{:?}", item.state).to_ascii_lowercase(), encoded, Utc::now().to_rfc3339()],
+            )
+            .map_err(|error| KbctlError::State(error.to_string()))?;
+        Ok(())
+    }
+
+    pub fn work_item(&self, id: &str) -> Result<Option<WorkItem>, KbctlError> {
+        self.read_json("SELECT item_json FROM work_items WHERE id = ?1", id)
+    }
+
+    pub fn work_items(
+        &self,
+        parent_task_id: &str,
+        version: u32,
+    ) -> Result<Vec<WorkItem>, KbctlError> {
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare("SELECT item_json FROM work_items WHERE parent_task_id = ?1 AND plan_version = ?2 ORDER BY rowid")
+            .map_err(|error| KbctlError::State(error.to_string()))?;
+        let rows = statement
+            .query_map(params![parent_task_id, version], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|error| KbctlError::State(error.to_string()))?;
+        rows.map(|row| {
+            let encoded = row.map_err(|error| KbctlError::State(error.to_string()))?;
+            serde_json::from_str(&encoded).map_err(|error| KbctlError::State(error.to_string()))
+        })
+        .collect()
+    }
+
+    pub fn record_submission(
+        &self,
+        execution_id: &str,
+        envelope: &SubmissionEnvelope,
+    ) -> Result<bool, KbctlError> {
+        let connection = self.connection()?;
+        let encoded = serde_json::to_string(envelope)
+            .map_err(|error| KbctlError::State(error.to_string()))?;
+        let submission_key = Self::submission_key(envelope);
+        let inserted = connection
+            .execute(
+                "INSERT OR IGNORE INTO submissions (execution_id, submission_key, envelope_json) VALUES (?1, ?2, ?3)",
+                params![execution_id, submission_key, encoded],
+            )
+            .map_err(|error| KbctlError::State(error.to_string()))?;
+        Ok(inserted == 1)
+    }
+
+    pub fn submission_key(envelope: &SubmissionEnvelope) -> String {
+        match envelope {
+            SubmissionEnvelope::Plan { plan } => format!("plan:{}", plan.version),
+            SubmissionEnvelope::Completion { completion } => {
+                format!("completion:{}", completion.work_item_id)
+            }
+            SubmissionEnvelope::Review { review } => {
+                format!("review:{}:{}", review.target_id, review.review_round)
+            }
+        }
+    }
+
+    pub fn submission_by_key(
+        &self,
+        execution_id: &str,
+        submission_key: &str,
+    ) -> Result<Option<SubmissionEnvelope>, KbctlError> {
+        let connection = self.connection()?;
+        let encoded = connection
+            .query_row(
+                "SELECT envelope_json FROM submissions WHERE execution_id = ?1 AND submission_key = ?2",
+                params![execution_id, submission_key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| KbctlError::State(error.to_string()))?;
+        encoded
+            .map(|value| {
+                serde_json::from_str(&value).map_err(|error| KbctlError::State(error.to_string()))
+            })
+            .transpose()
+    }
+
+    pub fn submission(&self, execution_id: &str) -> Result<Option<SubmissionEnvelope>, KbctlError> {
+        self.read_json(
+            "SELECT envelope_json FROM submissions WHERE execution_id = ?1 ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            execution_id,
+        )
+    }
+
+    pub fn record_runtime_event(
+        &self,
+        source: &str,
+        event_id: &str,
+        payload: &serde_json::Value,
+    ) -> Result<bool, KbctlError> {
+        let connection = self.connection()?;
+        let inserted = connection
+            .execute(
+                "INSERT OR IGNORE INTO runtime_events (source, event_id, payload_json) VALUES (?1, ?2, ?3)",
+                params![source, event_id, payload.to_string()],
+            )
+            .map_err(|error| KbctlError::State(error.to_string()))?;
+        Ok(inserted == 1)
+    }
+
+    fn read_json<T: serde::de::DeserializeOwned>(
+        &self,
+        query: &str,
+        key: &str,
+    ) -> Result<Option<T>, KbctlError> {
+        let connection = self.connection()?;
+        let encoded = connection
+            .query_row(query, params![key], |row| row.get::<_, String>(0))
+            .optional()
+            .map_err(|error| KbctlError::State(error.to_string()))?;
+        decode_optional(encoded)
+    }
+
     fn initialize(&self) -> Result<(), KbctlError> {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent).map_err(|error| {
@@ -438,9 +648,70 @@ impl Store {
                      id TEXT PRIMARY KEY,
                      task_json TEXT NOT NULL,
                      updated_at TEXT NOT NULL
-                 );",
+                 );
+                 CREATE TABLE IF NOT EXISTS orchestration_runs (
+                     parent_task_id TEXT PRIMARY KEY,
+                     run_json TEXT NOT NULL,
+                     updated_at TEXT NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS plans (
+                     parent_task_id TEXT NOT NULL,
+                     version INTEGER NOT NULL,
+                     plan_json TEXT NOT NULL,
+                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                     PRIMARY KEY (parent_task_id, version)
+                 );
+                 CREATE TABLE IF NOT EXISTS work_items (
+                     id TEXT PRIMARY KEY,
+                     parent_task_id TEXT NOT NULL,
+                     plan_version INTEGER NOT NULL,
+                     state TEXT NOT NULL,
+                     item_json TEXT NOT NULL,
+                     updated_at TEXT NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS submissions (
+                     execution_id TEXT NOT NULL,
+                     submission_key TEXT NOT NULL,
+                     envelope_json TEXT NOT NULL,
+                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                     PRIMARY KEY (execution_id, submission_key)
+                 );
+                 CREATE TABLE IF NOT EXISTS runtime_events (
+                     source TEXT NOT NULL,
+                     event_id TEXT NOT NULL,
+                     payload_json TEXT NOT NULL,
+                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                     PRIMARY KEY (source, event_id)
+                 );
+                 PRAGMA user_version = 2;",
             )
             .map_err(|error| KbctlError::State(error.to_string()))?;
+        let mut columns = connection
+            .prepare("PRAGMA table_info(submissions)")
+            .map_err(|error| KbctlError::State(error.to_string()))?;
+        let names = columns
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|error| KbctlError::State(error.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| KbctlError::State(error.to_string()))?;
+        drop(columns);
+        if !names.iter().any(|name| name == "submission_key") {
+            connection
+                .execute_batch(
+                    "ALTER TABLE submissions RENAME TO submissions_v1;
+                     CREATE TABLE submissions (
+                         execution_id TEXT NOT NULL,
+                         submission_key TEXT NOT NULL,
+                         envelope_json TEXT NOT NULL,
+                         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                         PRIMARY KEY (execution_id, submission_key)
+                     );
+                     INSERT INTO submissions (execution_id, submission_key, envelope_json, created_at)
+                     SELECT execution_id, 'legacy', envelope_json, created_at FROM submissions_v1;
+                     DROP TABLE submissions_v1;",
+                )
+                .map_err(|error| KbctlError::State(error.to_string()))?;
+        }
         Ok(())
     }
 
@@ -448,6 +719,16 @@ impl Store {
         Connection::open(&self.path)
             .map_err(|error| KbctlError::State(format!("open {}: {error}", self.path.display())))
     }
+}
+
+fn decode_optional<T: serde::de::DeserializeOwned>(
+    encoded: Option<String>,
+) -> Result<Option<T>, KbctlError> {
+    encoded
+        .map(|value| {
+            serde_json::from_str(&value).map_err(|error| KbctlError::State(error.to_string()))
+        })
+        .transpose()
 }
 
 #[cfg(test)]
@@ -545,6 +826,23 @@ mod tests {
         assert_eq!(
             store.execution_for_task("task-1").unwrap().unwrap().id,
             current.id
+        );
+    }
+
+    #[test]
+    fn runtime_events_are_idempotent() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path().join("state.db")).unwrap();
+        let payload = serde_json::json!({"state": "done"});
+        assert!(
+            store
+                .record_runtime_event("herdr", "event-1", &payload)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .record_runtime_event("herdr", "event-1", &payload)
+                .unwrap()
         );
     }
 }

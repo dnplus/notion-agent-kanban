@@ -16,6 +16,7 @@ crossterm = "0.28"
 dotenvy = "0.15"
 fs2 = "0.4"
 futures = "0.3"
+globset = "0.4"
 notionrs = "0.32"
 notionrs_types = "0.24"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }

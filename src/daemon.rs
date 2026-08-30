@@ -1,17 +1,21 @@
 use crate::{
     config::{Config, LocalProjectBinding},
-    domain::{Execution, ExecutionMode, Task, TaskStatus, WorkContract},
+    domain::{
+        Execution, ExecutionMode, ExecutionRole, OrchestrationRun, PlanState, Task, TaskStatus,
+        WorkContract, WorkItem, WorkItemState, WorkMode,
+    },
     error::KbctlError,
+    git_workspace,
     herdr::{AgentRuntime, RuntimeState},
     notion::{KanbanProvider, ProjectUpdate, TaskUpdate},
-    report_spool,
+    orchestration, report_spool,
     store::{PendingReport, Store},
 };
 use chrono::{Duration as ChronoDuration, Utc};
 use std::{
     collections::{HashMap, HashSet},
     fs,
-    path::Path,
+    path::{Path, PathBuf},
     sync::Arc,
 };
 use tokio::time::{self, Duration, MissedTickBehavior};
@@ -48,6 +52,12 @@ impl Daemon {
 
     pub async fn run(&self) -> Result<(), KbctlError> {
         let _lock = self.store.acquire_daemon_lock()?;
+        for execution in self.store.running_executions()? {
+            if let Some(runtime_id) = execution.runtime_id.as_deref() {
+                self.runtime.watch(runtime_id)?;
+            }
+        }
+        let mut runtime_events = self.runtime.subscribe();
         let interval_seconds = self.config.daemon.poll_interval_seconds.max(1);
         let mut interval = time::interval(Duration::from_secs(interval_seconds));
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -66,6 +76,16 @@ impl Daemon {
                         }
                         Err(error) => {
                             tracing::warn!(error = %error, "daemon cycle failed");
+                        }
+                    }
+                }
+                event = receive_runtime_event(&mut runtime_events) => {
+                    if let Some(event) = event
+                        && self.store.record_runtime_event("herdr", &event.event_id, &event.payload)?
+                    {
+                        tracing::info!(pane_id = %event.pane_id, state = ?event.state, "Herdr runtime event triggered reconciliation");
+                        if let Err(error) = self.run_once().await {
+                            tracing::warn!(error = %error, "event-driven daemon cycle failed");
                         }
                     }
                 }
@@ -91,6 +111,16 @@ impl Daemon {
         let tasks = self.provider.list_tasks().await?;
         self.store.cache_tasks(&tasks)?;
         summary.tasks_seen = tasks.len();
+        for task in &tasks {
+            if self.store.orchestration_run(&task.id)?.is_some() {
+                match self.advance_orchestration(task).await {
+                    Ok(dispatched) => summary.dispatched += dispatched,
+                    Err(error) => {
+                        tracing::warn!(task_id = %task.id, error = %error, "orchestration advance failed")
+                    }
+                }
+            }
+        }
         let task_projects = tasks
             .iter()
             .map(|task| {
@@ -116,6 +146,9 @@ impl Daemon {
                 break;
             }
             if !task.status.is_dispatchable(Utc::now(), task.scheduled_at) {
+                continue;
+            }
+            if self.store.orchestration_run(&task.id)?.is_some() {
                 continue;
             }
             if reconciled_tasks.contains(&task.id) {
@@ -176,15 +209,51 @@ impl Daemon {
         } else {
             ExecutionMode::Execute
         };
-        let agent_kind = task
-            .agent
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-            .or(Some(binding.default_agent.as_str()))
-            .unwrap_or("codex")
-            .to_string();
+        let profile_name = if mode == ExecutionMode::Triage {
+            self.config.orchestration.supervisor_profile.clone()
+        } else {
+            task.agent
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or(binding.default_agent.as_str())
+                .to_string()
+        };
+        let profile = self.config.profile(&profile_name).ok_or_else(|| {
+            KbctlError::Validation(format!("unknown agent profile: {profile_name}"))
+        })?;
+        if mode == ExecutionMode::Triage && profile.role != ExecutionRole::Supervisor {
+            return Err(KbctlError::Validation(format!(
+                "triage profile {profile_name} is not a supervisor"
+            )));
+        }
+        let agent_kind = profile.kind.clone();
         let attempt = self.store.next_execution_attempt(&task.id)?;
-        let execution = Execution::new_with_attempt(&task.id, &agent_kind, mode, attempt);
+        let mut execution = Execution::new_with_attempt(&task.id, &agent_kind, mode, attempt);
+        if mode == ExecutionMode::Triage {
+            execution.role = ExecutionRole::Supervisor;
+            execution.parent_task_id = Some(task.id.clone());
+            execution.plan_version = Some(match self.store.orchestration_run(&task.id)? {
+                Some(run)
+                    if run.state == PlanState::Planning
+                        && self.store.plan(&task.id, run.plan_version)?.is_none() =>
+                {
+                    run.plan_version
+                }
+                Some(run) => run.plan_version.saturating_add(1),
+                None => 1,
+            });
+            self.store.save_orchestration_run(&OrchestrationRun {
+                parent_task_id: task.id.clone(),
+                plan_version: execution.plan_version.unwrap_or(1),
+                state: PlanState::Planning,
+                supervisor_execution_id: Some(execution.id.clone()),
+                approved_plan_version: None,
+                base_commit: None,
+                base_branch: None,
+                integration_branch: None,
+                updated_at: Utc::now(),
+            })?;
+        }
         self.store.save_execution(&execution)?;
         if let Err(error) = self
             .provider
@@ -204,6 +273,25 @@ impl Daemon {
         running_task.status = TaskStatus::Running;
         running_task.execution_id = Some(execution.id.clone());
         self.store.cache_task(&running_task)?;
+        let contract_path = binding.path.clone();
+        let submission_path = if execution.role == ExecutionRole::Supervisor {
+            std::env::temp_dir()
+                .join("kbctl/submissions")
+                .join(format!("{}.json", execution.id))
+        } else {
+            report_spool::submission_path_for(Path::new(&contract_path), &execution.id)
+        };
+        execution.checkout_path = Some(contract_path.clone());
+        execution.submission_path = Some(submission_path.display().to_string());
+        if let Some(parent) = submission_path.parent() {
+            fs::create_dir_all(parent).map_err(|error| {
+                KbctlError::State(format!(
+                    "create submission spool directory {}: {error}",
+                    parent.display()
+                ))
+            })?;
+        }
+        self.store.save_execution(&execution)?;
         let contract = WorkContract {
             task_id: task.id.clone(),
             execution_id: execution.id.clone(),
@@ -211,20 +299,37 @@ impl Daemon {
             title: task.name.clone(),
             body: task.body.clone().unwrap_or_default(),
             project_name: binding.name.clone(),
-            project_path: binding.path.clone(),
+            project_path: contract_path,
             due: task.due,
             scheduled_at: task.scheduled_at,
             agent_kind,
+            profile_name,
+            role: execution.role,
+            model: profile.model,
+            reasoning: profile.reasoning,
+            agent: profile.agent,
+            read_only: execution.role == ExecutionRole::Supervisor,
+            plan_version: execution.plan_version,
+            work_item_id: None,
+            submission_path: submission_path.display().to_string(),
             report_command: format!(
                 "kbctl report <done|blocked|review> --execution {}",
                 execution.id
             ),
         };
-        let runtime_id = match self.runtime.start(&execution, &contract).await {
+        let runtime_id = match self.runtime.ensure(&execution, &contract).await {
             Ok(value) => value,
             Err(error) => {
                 self.store
                     .mark_execution_state(&execution.id, "runtime_failed")?;
+                if execution.role == ExecutionRole::Supervisor
+                    && let Some(mut run) = self.store.orchestration_run(&task.id)?
+                {
+                    run.supervisor_execution_id = None;
+                    run.state = PlanState::Planning;
+                    run.updated_at = Utc::now();
+                    self.store.save_orchestration_run(&run)?;
+                }
                 let reason = format!("Herdr could not start the agent: {error}");
                 let _ = self
                     .provider
@@ -273,21 +378,37 @@ impl Daemon {
                 reconciled_tasks.insert(execution.task_id);
                 continue;
             }
-            if self.store.report(&execution.id)?.is_some() {
-                continue;
-            }
-            match self.ingest_spooled_report(&task, &execution) {
-                Ok(true) => {
-                    reconciled_tasks.insert(execution.task_id);
+            if execution.role != ExecutionRole::Standalone {
+                match self.ingest_spooled_submission(&execution) {
+                    Ok(true) => {
+                        reconciled_tasks.insert(execution.task_id.clone());
+                        continue;
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        tracing::warn!(execution_id = %execution.id, error = %error, "agent submission spool could not be ingested")
+                    }
+                }
+                if self.store.execution_state(&execution.id)?.as_deref() != Some("running") {
                     continue;
                 }
-                Ok(false) => {}
-                Err(error) => {
-                    tracing::warn!(
-                        execution_id = %execution.id,
-                        error = %error,
-                        "agent report spool could not be ingested"
-                    );
+            } else {
+                if self.store.report(&execution.id)?.is_some() {
+                    continue;
+                }
+                match self.ingest_spooled_report(&task, &execution) {
+                    Ok(true) => {
+                        reconciled_tasks.insert(execution.task_id);
+                        continue;
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        tracing::warn!(
+                            execution_id = %execution.id,
+                            error = %error,
+                            "agent report spool could not be ingested"
+                        );
+                    }
                 }
             }
             let state = match execution.runtime_id.as_deref() {
@@ -300,7 +421,15 @@ impl Daemon {
                 },
                 None => RuntimeState::Done,
             };
-            if !matches!(state, RuntimeState::Done) {
+            if !matches!(
+                state,
+                RuntimeState::Done | RuntimeState::Idle | RuntimeState::Unknown
+            ) {
+                continue;
+            }
+            if execution.role != ExecutionRole::Standalone {
+                self.retry_or_block_orchestration(&task, &execution).await?;
+                reconciled_tasks.insert(execution.task_id);
                 continue;
             }
             if execution.attempt < self.config.daemon.max_attempts.max(1) {
@@ -387,6 +516,601 @@ impl Daemon {
             KbctlError::State(format!("remove report spool {}: {error}", path.display()))
         })?;
         Ok(true)
+    }
+
+    fn ingest_spooled_submission(&self, execution: &Execution) -> Result<bool, KbctlError> {
+        let task = self
+            .store
+            .cached_tasks()?
+            .into_iter()
+            .find(|task| task.id == execution.task_id)
+            .ok_or_else(|| {
+                KbctlError::State(format!("task {} is not cached", execution.task_id))
+            })?;
+        let binding = self.binding_for(&task)?;
+        let path = execution
+            .submission_path
+            .as_deref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                let root = execution
+                    .checkout_path
+                    .as_deref()
+                    .unwrap_or(binding.path.as_str());
+                report_spool::submission_path_for(Path::new(root), &execution.id)
+            });
+        if !path.is_file() {
+            return Ok(false);
+        }
+        let spooled = report_spool::read_submission(&path)?;
+        if spooled.execution_id != execution.id {
+            return Err(KbctlError::Validation(format!(
+                "submission execution {} does not match {}",
+                spooled.execution_id, execution.id
+            )));
+        }
+        orchestration::apply_submission(
+            &self.config,
+            &self.store,
+            &execution.id,
+            &spooled.envelope,
+        )?;
+        fs::remove_file(&path).map_err(|error| {
+            KbctlError::State(format!(
+                "remove submission spool {}: {error}",
+                path.display()
+            ))
+        })?;
+        self.store
+            .mark_execution_state(&execution.id, "submitted")?;
+        Ok(true)
+    }
+
+    async fn retry_or_block_orchestration(
+        &self,
+        task: &Task,
+        execution: &Execution,
+    ) -> Result<(), KbctlError> {
+        if execution.attempt < self.config.daemon.max_attempts.max(1) {
+            if let Some(work_item_id) = execution.work_item_id.as_deref() {
+                if let Some(mut item) = self.store.work_item(work_item_id)? {
+                    item.state = WorkItemState::Pending;
+                    item.execution_id = None;
+                    self.store.save_work_item(&item)?;
+                }
+            } else if let Some(mut run) = self.store.orchestration_run(&task.id)? {
+                run.state = PlanState::Planning;
+                run.supervisor_execution_id = None;
+                run.updated_at = Utc::now();
+                self.store.save_orchestration_run(&run)?;
+                self.provider
+                    .update_task(TaskUpdate {
+                        id: task.id.clone(),
+                        status: Some(TaskStatus::Triage),
+                        clear_execution_id: true,
+                        result: Some(
+                            "supervisor exited without a valid submission; retrying".to_string(),
+                        ),
+                        ..Default::default()
+                    })
+                    .await?;
+            }
+            let retry_at =
+                Utc::now() + ChronoDuration::seconds(self.config.daemon.retry_delay_seconds as i64);
+            self.store.mark_execution_retry(&execution.id, retry_at)?;
+            return Ok(());
+        }
+        if let Some(work_item_id) = execution.work_item_id.as_deref()
+            && let Some(mut item) = self.store.work_item(work_item_id)?
+        {
+            item.state = WorkItemState::Failed;
+            item.summary = Some("agent exited without a valid submission".to_string());
+            self.store.save_work_item(&item)?;
+        }
+        if let Some(mut run) = self.store.orchestration_run(&task.id)? {
+            run.state = PlanState::Blocked;
+            run.updated_at = Utc::now();
+            self.store.save_orchestration_run(&run)?;
+        }
+        self.provider
+            .update_task(TaskUpdate {
+                id: task.id.clone(),
+                status: Some(TaskStatus::Review),
+                clear_execution_id: true,
+                result: Some(
+                    "orchestration agent exhausted retries without a valid submission".to_string(),
+                ),
+                ..Default::default()
+            })
+            .await?;
+        self.store
+            .mark_execution_state(&execution.id, "ended_without_submission")?;
+        Ok(())
+    }
+
+    async fn advance_orchestration(&self, task: &Task) -> Result<usize, KbctlError> {
+        let Some(mut run) = self.store.orchestration_run(&task.id)? else {
+            return Ok(0);
+        };
+        if matches!(task.status, TaskStatus::Cancel | TaskStatus::Archived) {
+            run.state = PlanState::Cancelled;
+            run.updated_at = Utc::now();
+            self.store.save_orchestration_run(&run)?;
+            for mut item in self.store.work_items(&task.id, run.plan_version)? {
+                if !matches!(item.state, WorkItemState::Merged | WorkItemState::Cancelled) {
+                    item.state = WorkItemState::Cancelled;
+                    self.store.save_work_item(&item)?;
+                }
+            }
+            return Ok(0);
+        }
+        if run.state == PlanState::Planning && run.supervisor_execution_id.is_none() {
+            if task.status == TaskStatus::Triage {
+                self.dispatch(task).await?;
+                return Ok(1);
+            }
+            return Ok(0);
+        }
+        if run.state == PlanState::AwaitingApproval && task.status == TaskStatus::Ready {
+            run.approved_plan_version = Some(run.plan_version);
+            run.state = PlanState::Executing;
+            run.updated_at = Utc::now();
+            self.store.save_orchestration_run(&run)?;
+            self.provider
+                .update_task(TaskUpdate {
+                    id: task.id.clone(),
+                    status: Some(TaskStatus::Running),
+                    result: Some(format!("approved plan v{}", run.plan_version)),
+                    ..Default::default()
+                })
+                .await?;
+        }
+        let Some(plan) = self.store.plan(&task.id, run.plan_version)? else {
+            return Ok(0);
+        };
+        if run.state == PlanState::AwaitingApproval
+            && !matches!(task.status, TaskStatus::Review | TaskStatus::Ready)
+        {
+            self.provider
+                .append_result(
+                    &task.id,
+                    &format!("Plan v{}\n{}", plan.version, plan.summary),
+                )
+                .await?;
+            self.provider
+                .update_task(TaskUpdate {
+                    id: task.id.clone(),
+                    status: Some(TaskStatus::Review),
+                    clear_execution_id: true,
+                    result: Some(format!("plan v{} awaits approval", plan.version)),
+                    ..Default::default()
+                })
+                .await?;
+        }
+        let mut items = self.store.work_items(&task.id, run.plan_version)?;
+        for item in items
+            .iter_mut()
+            .filter(|item| item.state == WorkItemState::Accepted)
+        {
+            if let Err(error) = self.integrate_work_item(&mut run, item).await {
+                item.state = WorkItemState::Blocked;
+                item.summary = Some(error.to_string());
+                run.state = PlanState::Blocked;
+                run.updated_at = Utc::now();
+                self.store.save_orchestration_run(&run)?;
+            }
+            self.store.save_work_item(item)?;
+        }
+        for item in items
+            .iter_mut()
+            .filter(|item| item.state == WorkItemState::Rework)
+        {
+            if item.review_round > self.config.orchestration.max_rework {
+                item.state = WorkItemState::Blocked;
+                run.state = PlanState::Blocked;
+            } else {
+                item.state = WorkItemState::Pending;
+                item.execution_id = None;
+                item.head_commit = None;
+            }
+            self.store.save_work_item(item)?;
+        }
+        for item in items
+            .iter_mut()
+            .filter(|item| item.state == WorkItemState::Submitted)
+        {
+            item.state = WorkItemState::Reviewing;
+            self.store.save_work_item(item)?;
+            if let Err(error) = self.request_work_item_review(&run, item).await {
+                if let Some(execution_id) = run.supervisor_execution_id.as_deref() {
+                    self.store
+                        .mark_execution_state(execution_id, "prompt_failed")?;
+                }
+                item.state = WorkItemState::Blocked;
+                item.summary = Some(error.to_string());
+                run.state = PlanState::Blocked;
+                run.updated_at = Utc::now();
+                self.store.save_work_item(item)?;
+                self.store.save_orchestration_run(&run)?;
+                self.provider
+                    .update_task(TaskUpdate {
+                        id: task.id.clone(),
+                        status: Some(TaskStatus::Blocked),
+                        clear_execution_id: true,
+                        result: Some(error.to_string()),
+                        ..Default::default()
+                    })
+                    .await?;
+                return Ok(0);
+            }
+        }
+        items = self.store.work_items(&task.id, run.plan_version)?;
+        if run.state == PlanState::Done {
+            self.provider
+                .update_task(TaskUpdate {
+                    id: task.id.clone(),
+                    status: Some(TaskStatus::Done),
+                    clear_execution_id: true,
+                    result: Some(format!("plan v{} accepted", run.plan_version)),
+                    ..Default::default()
+                })
+                .await?;
+            return Ok(0);
+        }
+        if run.state == PlanState::AwaitingMerge {
+            self.provider
+                .update_task(TaskUpdate {
+                    id: task.id.clone(),
+                    status: Some(TaskStatus::Review),
+                    clear_execution_id: true,
+                    result: Some(format!(
+                        "integration branch {} awaits human merge",
+                        run.integration_branch.as_deref().unwrap_or("missing")
+                    )),
+                    ..Default::default()
+                })
+                .await?;
+            return Ok(0);
+        }
+        if !items.is_empty() && items.iter().all(|item| item.state == WorkItemState::Merged) {
+            if run.state != PlanState::Reviewing
+                && !matches!(run.state, PlanState::AwaitingMerge | PlanState::Done)
+            {
+                if let Err(error) = self.prepare_final_review(&run, task).await {
+                    run.state = PlanState::Blocked;
+                    run.updated_at = Utc::now();
+                    self.store.save_orchestration_run(&run)?;
+                    self.provider
+                        .update_task(TaskUpdate {
+                            id: task.id.clone(),
+                            status: Some(TaskStatus::Blocked),
+                            clear_execution_id: true,
+                            result: Some(error.to_string()),
+                            ..Default::default()
+                        })
+                        .await?;
+                    return Ok(0);
+                }
+                run.state = PlanState::Reviewing;
+                run.updated_at = Utc::now();
+                self.store.save_orchestration_run(&run)?;
+                if let Err(error) = self.request_final_review(&run, &items).await {
+                    if let Some(execution_id) = run.supervisor_execution_id.as_deref() {
+                        self.store
+                            .mark_execution_state(execution_id, "prompt_failed")?;
+                    }
+                    run.state = PlanState::Blocked;
+                    run.updated_at = Utc::now();
+                    self.store.save_orchestration_run(&run)?;
+                    self.provider
+                        .update_task(TaskUpdate {
+                            id: task.id.clone(),
+                            status: Some(TaskStatus::Blocked),
+                            clear_execution_id: true,
+                            result: Some(error.to_string()),
+                            ..Default::default()
+                        })
+                        .await?;
+                }
+            }
+            return Ok(0);
+        }
+        if !matches!(
+            run.state,
+            PlanState::Executing | PlanState::AwaitingApproval
+        ) {
+            return Ok(0);
+        }
+        let approved = run.approved_plan_version == Some(run.plan_version);
+        let active = items
+            .iter()
+            .filter(|item| {
+                matches!(
+                    item.state,
+                    WorkItemState::Running | WorkItemState::Submitted | WorkItemState::Reviewing
+                )
+            })
+            .count();
+        let global_active = self.store.running_executions()?.len();
+        let global_capacity = self
+            .config
+            .daemon
+            .max_concurrency
+            .max(1)
+            .saturating_sub(global_active);
+        let capacity = self
+            .config
+            .orchestration
+            .max_workers_per_plan
+            .saturating_sub(active)
+            .min(global_capacity);
+        let runnable = orchestration::runnable_items(&items, approved, capacity);
+        let mut dispatched = 0;
+        for id in runnable {
+            let mut item = self
+                .store
+                .work_item(&id)?
+                .ok_or_else(|| KbctlError::State(format!("runnable work item {id} disappeared")))?;
+            self.dispatch_work_item(task, &plan.summary, &mut run, &mut item)
+                .await?;
+            self.store.save_work_item(&item)?;
+            dispatched += 1;
+        }
+        self.store.save_orchestration_run(&run)?;
+        Ok(dispatched)
+    }
+
+    async fn dispatch_work_item(
+        &self,
+        task: &Task,
+        plan_summary: &str,
+        run: &mut OrchestrationRun,
+        item: &mut WorkItem,
+    ) -> Result<(), KbctlError> {
+        let binding = self.binding_for(task)?;
+        let profile = self.config.profile(&item.step.profile).ok_or_else(|| {
+            KbctlError::Validation(format!("unknown profile: {}", item.step.profile))
+        })?;
+        let mut checkout_path = binding.path.clone();
+        let mut branch = None;
+        if item.step.mode == WorkMode::Write {
+            let snapshot = git_workspace::inspect(Path::new(&binding.path)).await?;
+            if !snapshot.clean {
+                return Err(KbctlError::Validation(
+                    "write orchestration requires a clean Git repository".to_string(),
+                ));
+            }
+            if run.base_commit.is_none() {
+                run.base_commit = Some(snapshot.head.clone());
+                run.base_branch = Some(snapshot.branch.clone());
+                run.integration_branch = Some(git_workspace::integration_branch(
+                    &task.id,
+                    run.plan_version,
+                ));
+            }
+            let root = worktree_root(&task.id, run.plan_version);
+            let integration_path = root.join("integration");
+            git_workspace::create_worktree(
+                &snapshot.root,
+                &integration_path,
+                run.integration_branch.as_deref().unwrap(),
+                run.base_commit.as_deref().unwrap(),
+            )
+            .await?;
+            let worker_branch =
+                git_workspace::worker_branch(&task.id, run.plan_version, &item.step.id);
+            let worker_path = root.join(&item.step.id);
+            git_workspace::create_worktree(
+                &snapshot.root,
+                &worker_path,
+                &worker_branch,
+                run.integration_branch.as_deref().unwrap(),
+            )
+            .await?;
+            checkout_path = worker_path.display().to_string();
+            branch = Some(worker_branch);
+        }
+        item.attempt = item.attempt.saturating_add(1);
+        let mut execution = Execution::new_with_attempt(
+            &task.id,
+            &profile.kind,
+            ExecutionMode::Execute,
+            item.attempt,
+        );
+        execution.role = ExecutionRole::Worker;
+        execution.parent_task_id = Some(task.id.clone());
+        execution.work_item_id = Some(item.id.clone());
+        execution.plan_version = Some(run.plan_version);
+        execution.checkout_path = Some(checkout_path.clone());
+        execution.branch = branch.clone();
+        let submission_path =
+            report_spool::submission_path_for(Path::new(&checkout_path), &execution.id);
+        if let Some(parent) = submission_path.parent() {
+            fs::create_dir_all(parent).map_err(|error| {
+                KbctlError::State(format!(
+                    "create submission spool directory {}: {error}",
+                    parent.display()
+                ))
+            })?;
+        }
+        execution.submission_path = Some(submission_path.display().to_string());
+        self.store.save_execution(&execution)?;
+        let body = format!(
+            "Parent plan: {plan_summary}\nStep: {}\nObjective: {}\nAcceptance:\n- {}\nWrite scope:\n- {}",
+            item.step.title,
+            item.step.objective,
+            item.step.acceptance.join("\n- "),
+            item.step.write_scope.join("\n- ")
+        );
+        let contract = WorkContract {
+            task_id: task.id.clone(),
+            execution_id: execution.id.clone(),
+            mode: ExecutionMode::Execute,
+            title: item.step.title.clone(),
+            body,
+            project_name: binding.name,
+            project_path: checkout_path,
+            due: task.due,
+            scheduled_at: task.scheduled_at,
+            agent_kind: profile.kind,
+            profile_name: item.step.profile.clone(),
+            role: ExecutionRole::Worker,
+            model: profile.model,
+            reasoning: profile.reasoning,
+            agent: profile.agent,
+            read_only: item.step.mode == WorkMode::Read,
+            plan_version: Some(run.plan_version),
+            work_item_id: Some(item.id.clone()),
+            submission_path: submission_path.display().to_string(),
+            report_command: format!(
+                "kbctl report submit --execution {} --manifest <file>",
+                execution.id
+            ),
+        };
+        let runtime_id = self.runtime.ensure(&execution, &contract).await?;
+        self.store.set_runtime_id(&execution.id, &runtime_id)?;
+        item.state = WorkItemState::Running;
+        item.execution_id = Some(execution.id);
+        item.branch = branch;
+        item.checkout_path = execution.checkout_path;
+        Ok(())
+    }
+
+    async fn request_work_item_review(
+        &self,
+        run: &OrchestrationRun,
+        item: &WorkItem,
+    ) -> Result<(), KbctlError> {
+        let execution_id = run.supervisor_execution_id.as_deref().ok_or_else(|| {
+            KbctlError::State("orchestration run has no supervisor execution".to_string())
+        })?;
+        let execution = self
+            .store
+            .execution(execution_id)?
+            .ok_or_else(|| KbctlError::State("supervisor execution was not found".to_string()))?;
+        let runtime_id = execution
+            .runtime_id
+            .as_deref()
+            .ok_or_else(|| KbctlError::State("supervisor runtime was not started".to_string()))?;
+        let prompt = format!(
+            "Review work item {}. Summary: {}. Head commit: {}. Return a Review envelope targeting {}, review_round {}. Use accept, rework, or blocked.",
+            item.step.title,
+            item.summary.as_deref().unwrap_or("missing"),
+            item.head_commit.as_deref().unwrap_or("none"),
+            item.id,
+            item.review_round.saturating_add(1)
+        );
+        self.store.mark_execution_state(execution_id, "running")?;
+        self.runtime.prompt(runtime_id, &prompt).await?;
+        Ok(())
+    }
+
+    async fn request_final_review(
+        &self,
+        run: &OrchestrationRun,
+        items: &[WorkItem],
+    ) -> Result<(), KbctlError> {
+        let execution_id = run.supervisor_execution_id.as_deref().ok_or_else(|| {
+            KbctlError::State("orchestration run has no supervisor execution".to_string())
+        })?;
+        let execution = self
+            .store
+            .execution(execution_id)?
+            .ok_or_else(|| KbctlError::State("supervisor execution was not found".to_string()))?;
+        let runtime_id = execution
+            .runtime_id
+            .as_deref()
+            .ok_or_else(|| KbctlError::State("supervisor runtime was not started".to_string()))?;
+        let summaries = items
+            .iter()
+            .map(|item| {
+                format!(
+                    "{}: {}",
+                    item.step.id,
+                    item.summary.as_deref().unwrap_or("missing")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.store.mark_execution_state(execution_id, "running")?;
+        self.runtime
+            .prompt(
+                runtime_id,
+                &format!(
+                    "Perform final Parent review for {}. Integrated work:\n{}\nReturn a Review envelope targeting {}.",
+                    run.parent_task_id, summaries, run.parent_task_id
+                ),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn prepare_final_review(
+        &self,
+        run: &OrchestrationRun,
+        task: &Task,
+    ) -> Result<(), KbctlError> {
+        let Some(base_branch) = run.base_branch.as_deref() else {
+            return Ok(());
+        };
+        let integration_path =
+            worktree_root(&run.parent_task_id, run.plan_version).join("integration");
+        git_workspace::merge(&integration_path, base_branch).await?;
+        let binding = self.binding_for(task)?;
+        git_workspace::run_checks(
+            &integration_path,
+            &binding.checks,
+            binding.check_timeout_seconds,
+        )
+        .await
+    }
+
+    async fn integrate_work_item(
+        &self,
+        run: &mut OrchestrationRun,
+        item: &mut WorkItem,
+    ) -> Result<(), KbctlError> {
+        if item.step.mode == WorkMode::Read {
+            item.state = WorkItemState::Merged;
+            return Ok(());
+        }
+        let head = item.head_commit.as_deref().ok_or_else(|| {
+            KbctlError::Validation(format!("work item {} has no head commit", item.id))
+        })?;
+        let base = run
+            .base_commit
+            .as_deref()
+            .ok_or_else(|| KbctlError::State("orchestration run has no base commit".to_string()))?;
+        let checkout = item
+            .checkout_path
+            .as_deref()
+            .ok_or_else(|| KbctlError::State(format!("work item {} has no checkout", item.id)))?;
+        let worker_snapshot = git_workspace::inspect(Path::new(checkout)).await?;
+        if worker_snapshot.head != head {
+            return Err(KbctlError::Validation(format!(
+                "submitted head {head} does not match worker branch head {}",
+                worker_snapshot.head
+            )));
+        }
+        let files = git_workspace::changed_files(Path::new(checkout), base, head).await?;
+        git_workspace::validate_write_scope(&files, &item.step.write_scope)?;
+        let integration_path =
+            worktree_root(&run.parent_task_id, run.plan_version).join("integration");
+        let branch = item
+            .branch
+            .as_deref()
+            .ok_or_else(|| KbctlError::State(format!("work item {} has no branch", item.id)))?;
+        git_workspace::merge(&integration_path, branch).await?;
+        let task = self.provider.get_task(&run.parent_task_id).await?;
+        let binding = self.binding_for(&task)?;
+        git_workspace::run_checks(
+            &integration_path,
+            &binding.checks,
+            binding.check_timeout_seconds,
+        )
+        .await?;
+        item.state = WorkItemState::Merged;
+        Ok(())
     }
 
     async fn flush_pending_reports(&self) -> Result<usize, KbctlError> {
@@ -508,6 +1232,40 @@ fn validate_task(task: &Task, binding: &LocalProjectBinding) -> Result<(), Kbctl
         )));
     }
     Ok(())
+}
+
+fn worktree_root(parent_task_id: &str, plan_version: u32) -> PathBuf {
+    let safe = parent_task_id
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '-' {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    crate::config::default_state_path()
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("worktrees")
+        .join(safe)
+        .join(format!("v{plan_version}"))
+}
+
+async fn receive_runtime_event(
+    receiver: &mut Option<tokio::sync::broadcast::Receiver<crate::herdr::RuntimeEvent>>,
+) -> Option<crate::herdr::RuntimeEvent> {
+    match receiver {
+        Some(receiver) => loop {
+            match receiver.recv().await {
+                Ok(event) => return Some(event),
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+            }
+        },
+        None => std::future::pending().await,
+    }
 }
 
 impl std::fmt::Debug for Daemon {
@@ -750,6 +1508,8 @@ mod tests {
                     path: path.to_string(),
                     default_agent: "codex".to_string(),
                     active: true,
+                    checks: Vec::new(),
+                    check_timeout_seconds: 900,
                 }),
                 bindings: Default::default(),
             },
@@ -760,6 +1520,8 @@ mod tests {
                 retry_delay_seconds: 15,
             },
             herdr: HerdrConfig::default(),
+            orchestration: Default::default(),
+            profiles: Default::default(),
         }
     }
 

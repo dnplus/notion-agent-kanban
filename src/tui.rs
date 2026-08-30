@@ -77,18 +77,22 @@ struct ContextMenu {
 enum MenuAction {
     Move(TaskStatus),
     Focus,
+    Retry,
+    Diff,
     Refresh,
     Close,
 }
 
 impl ContextMenu {
-    const ITEMS: [(MenuAction, &'static str); 8] = [
+    const ITEMS: [(MenuAction, &'static str); 10] = [
         (MenuAction::Move(TaskStatus::Backlog), "1 backlog"),
         (MenuAction::Move(TaskStatus::Triage), "2 triage"),
         (MenuAction::Move(TaskStatus::Scheduled), "3 scheduled"),
         (MenuAction::Move(TaskStatus::Ready), "4 ready"),
         (MenuAction::Move(TaskStatus::Cancel), "c cancel"),
         (MenuAction::Focus, "f focus"),
+        (MenuAction::Retry, "t retry"),
+        (MenuAction::Diff, "d integration diff"),
         (MenuAction::Refresh, "r refresh"),
         (MenuAction::Close, "esc close"),
     ];
@@ -137,6 +141,16 @@ struct BoardRegions {
     details: Rect,
     keys: Rect,
     message: Rect,
+}
+
+struct BoardView<'a> {
+    store: &'a Store,
+    tasks: &'a [Task],
+    selected: usize,
+    message: Option<&'a str>,
+    menu: Option<&'a ContextMenu>,
+    new_task: Option<&'a NewTaskState>,
+    detail_open: bool,
 }
 
 fn board_regions(area: Rect) -> BoardRegions {
@@ -275,7 +289,7 @@ fn selected_task(tasks: &[Task], options: &BoardOptions) -> Option<usize> {
 pub async fn run(config: Config, options: BoardOptions) -> Result<(), KbctlError> {
     let store = Store::open(default_state_path())?;
     let provider = NotionProvider::new(config.clone()).ok();
-    let runtime = HerdrRuntime::new(config.herdr.binary);
+    let runtime = HerdrRuntime::new(config.herdr.binary.clone());
     let mut tasks = store.cached_tasks()?;
     let mut message = None;
     if tasks.is_empty() {
@@ -294,9 +308,7 @@ pub async fn run(config: Config, options: BoardOptions) -> Result<(), KbctlError
     let mut terminal = Terminal::new(backend)
         .map_err(|error| KbctlError::Runtime(format!("create board terminal: {error}")))?;
     let result = board_loop(
-        provider.as_ref(),
-        &store,
-        &runtime,
+        (&config, provider.as_ref(), &store, &runtime),
         &mut tasks,
         &mut message,
         selected.unwrap_or(0),
@@ -315,18 +327,18 @@ pub async fn run(config: Config, options: BoardOptions) -> Result<(), KbctlError
 }
 
 async fn board_loop(
-    provider: Option<&NotionProvider>,
-    store: &Store,
-    runtime: &HerdrRuntime,
+    services: (&Config, Option<&NotionProvider>, &Store, &HerdrRuntime),
     tasks: &mut Vec<Task>,
     message: &mut Option<String>,
     initial_selected: usize,
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
 ) -> Result<(), KbctlError> {
+    let (config, provider, store, runtime) = services;
     let mut selected = initial_selected;
     let mut cache_refresh_at = Instant::now() + Duration::from_secs(1);
     let mut menu = None;
     let mut new_task = None;
+    let mut detail_open = false;
     loop {
         if Instant::now() >= cache_refresh_at {
             if let Ok(cached) = store.cached_tasks()
@@ -339,11 +351,15 @@ async fn board_loop(
         }
         selected = selected.min(tasks.len().saturating_sub(1));
         draw(
-            tasks,
-            selected,
-            message.as_deref(),
-            menu.as_ref(),
-            new_task.as_ref(),
+            BoardView {
+                store,
+                tasks,
+                selected,
+                message: message.as_deref(),
+                menu: menu.as_ref(),
+                new_task: new_task.as_ref(),
+                detail_open,
+            },
             terminal,
         )?;
         if event::poll(Duration::from_millis(500))
@@ -439,6 +455,7 @@ async fn board_loop(
                             *message = None;
                             new_task = Some(NewTaskState::Name(String::new()));
                         }
+                        KeyCode::Enter => detail_open = !detail_open,
                         KeyCode::Char('r') => {
                             menu = None;
                             *message = refresh_tasks(provider, store, tasks).await;
@@ -520,6 +537,15 @@ async fn board_loop(
                             menu = None;
                             *message = focus_selected(store, runtime, tasks, selected).await;
                         }
+                        KeyCode::Char('t') => {
+                            menu = None;
+                            *message = retry_selected(store, tasks, selected);
+                        }
+                        KeyCode::Char('d') => {
+                            menu = None;
+                            *message =
+                                open_diff_selected(config, store, runtime, tasks, selected).await;
+                        }
                         _ => {}
                     }
                 }
@@ -555,6 +581,20 @@ async fn board_loop(
                                         active_menu.task_index.min(tasks.len().saturating_sub(1));
                                     *message =
                                         focus_selected(store, runtime, tasks, selected).await;
+                                }
+                                Some(MenuAction::Retry) => {
+                                    menu = None;
+                                    selected =
+                                        active_menu.task_index.min(tasks.len().saturating_sub(1));
+                                    *message = retry_selected(store, tasks, selected);
+                                }
+                                Some(MenuAction::Diff) => {
+                                    menu = None;
+                                    selected =
+                                        active_menu.task_index.min(tasks.len().saturating_sub(1));
+                                    *message =
+                                        open_diff_selected(config, store, runtime, tasks, selected)
+                                            .await;
                                 }
                                 None => menu = None,
                             }
@@ -776,43 +816,123 @@ async fn focus_selected(
     let Some(task) = tasks.get(selected) else {
         return Some("no task selected".to_string());
     };
-    let Some(execution_id) = task.execution_id.as_deref() else {
-        return Some("selected task has no active execution".to_string());
-    };
-    let Ok(Some(execution)) = store.execution(execution_id) else {
+    let execution = task
+        .execution_id
+        .as_deref()
+        .and_then(|execution_id| store.execution(execution_id).ok().flatten())
+        .or_else(|| store.execution_for_task(&task.id).ok().flatten());
+    let Some(execution) = execution else {
         return Some("execution is not in local state".to_string());
     };
     let Some(runtime_id) = execution.runtime_id.as_deref() else {
         return Some("execution has no Herdr runtime yet".to_string());
     };
     match runtime.focus(runtime_id).await {
-        Ok(()) => Some(format!("focused {execution_id}")),
+        Ok(()) => Some(format!("focused {}", execution.id)),
         Err(error) => Some(format!("focus failed: {error}")),
     }
 }
 
-fn draw(
+fn retry_selected(store: &Store, tasks: &[Task], selected: usize) -> Option<String> {
+    let task = tasks.get(selected)?;
+    let mut run = match store.orchestration_run(&task.id) {
+        Ok(Some(run)) => run,
+        Ok(None) => return Some("task has no orchestration run".to_string()),
+        Err(error) => return Some(format!("retry failed: {error}")),
+    };
+    let items = match store.work_items(&task.id, run.plan_version) {
+        Ok(items) => items,
+        Err(error) => return Some(format!("retry failed: {error}")),
+    };
+    let mut changed = 0;
+    for mut item in items {
+        if matches!(
+            item.state,
+            crate::domain::WorkItemState::Blocked
+                | crate::domain::WorkItemState::Failed
+                | crate::domain::WorkItemState::Rework
+        ) {
+            item.state = crate::domain::WorkItemState::Pending;
+            item.execution_id = None;
+            item.summary = None;
+            if let Err(error) = store.save_work_item(&item) {
+                return Some(format!("retry failed: {error}"));
+            }
+            changed += 1;
+        }
+    }
+    if changed == 0 && store.latest_plan(&task.id).ok().flatten().is_none() {
+        run.state = crate::domain::PlanState::Planning;
+        run.supervisor_execution_id = None;
+        run.updated_at = Utc::now();
+        if let Err(error) = store.save_orchestration_run(&run) {
+            return Some(format!("retry failed: {error}"));
+        }
+        return Some("Supervisor planning queued for retry".to_string());
+    }
+    if changed == 0 {
+        Some("no retryable work item".to_string())
+    } else {
+        run.state = crate::domain::PlanState::Executing;
+        run.updated_at = Utc::now();
+        match store.save_orchestration_run(&run) {
+            Ok(()) => Some(format!("queued {changed} work item(s) for retry")),
+            Err(error) => Some(format!("retry failed: {error}")),
+        }
+    }
+}
+
+async fn open_diff_selected(
+    config: &Config,
+    store: &Store,
+    runtime: &HerdrRuntime,
     tasks: &[Task],
     selected: usize,
-    message: Option<&str>,
-    menu: Option<&ContextMenu>,
-    new_task: Option<&NewTaskState>,
+) -> Option<String> {
+    let task = tasks.get(selected)?;
+    let run = match store.orchestration_run(&task.id) {
+        Ok(Some(run)) => run,
+        Ok(None) => return Some("task has no orchestration run".to_string()),
+        Err(error) => return Some(format!("open diff failed: {error}")),
+    };
+    let Some(base) = run.base_branch.as_deref() else {
+        return Some("plan has no write integration diff".to_string());
+    };
+    let Some(integration) = run.integration_branch.as_deref() else {
+        return Some("plan has no integration branch".to_string());
+    };
+    let Some(binding) = config.project_binding(task.project_id.as_deref()) else {
+        return Some("task has no local project binding".to_string());
+    };
+    match runtime
+        .open_integration_diff(&binding.path, base, integration)
+        .await
+    {
+        Ok(()) => Some(format!("opened {base}...{integration}")),
+        Err(error) => Some(format!("open diff failed: {error}")),
+    }
+}
+
+fn draw(
+    view: BoardView<'_>,
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
 ) -> Result<(), KbctlError> {
     terminal
-        .draw(|frame| render_board(frame, tasks, selected, message, menu, new_task))
+        .draw(|frame| render_board(frame, &view))
         .map(|_| ())
         .map_err(|error| KbctlError::Runtime(format!("draw board: {error}")))
 }
 
-fn render_board(
-    frame: &mut Frame,
-    tasks: &[Task],
-    selected: usize,
-    message: Option<&str>,
-    menu: Option<&ContextMenu>,
-    new_task: Option<&NewTaskState>,
-) {
+fn render_board(frame: &mut Frame, view: &BoardView<'_>) {
+    let BoardView {
+        store,
+        tasks,
+        selected,
+        message,
+        menu,
+        new_task,
+        detail_open,
+    } = view;
     let area = frame.area();
     let regions = board_regions(area);
     let compact = is_compact(area.width);
@@ -834,13 +954,13 @@ fn render_board(
         regions.header,
     );
     if compact {
-        render_compact(frame, tasks, selected, regions.body);
+        render_compact(frame, tasks, *selected, regions.body);
     } else {
-        render_wide(frame, tasks, selected, regions.body);
+        render_wide(frame, tasks, *selected, regions.body);
     }
     let details = tasks
-        .get(selected)
-        .map(|task| task_detail_lines(task, area.width as usize))
+        .get(*selected)
+        .map(|task| task_detail_lines(store, task, area.width as usize))
         .unwrap_or_else(|| vec![Line::from(" selected: none")]);
     frame.render_widget(
         Paragraph::new(details)
@@ -867,18 +987,21 @@ fn render_board(
             .style(Style::default().fg(Color::DarkGray)),
         regions.keys,
     );
-    if let Some(message) = message {
+    if let Some(message) = *message {
         frame.render_widget(
             Paragraph::new(fit_cells(message, area.width as usize))
                 .style(Style::default().fg(Color::Yellow)),
             regions.message,
         );
     }
-    if let Some(menu) = menu {
+    if let Some(menu) = *menu {
         render_menu(frame, *menu);
     }
-    if let Some(new_task) = new_task {
+    if let Some(new_task) = *new_task {
         render_new_task(frame, new_task);
+    }
+    if *detail_open && let Some(task) = tasks.get(*selected) {
+        render_plan_detail(frame, store, task);
     }
 }
 
@@ -997,8 +1120,8 @@ fn single_line(value: &str) -> String {
     value.lines().collect::<Vec<_>>().join(" ")
 }
 
-fn task_detail_lines(task: &Task, width: usize) -> Vec<Line<'static>> {
-    let lines = [
+fn task_detail_lines(store: &Store, task: &Task, width: usize) -> Vec<Line<'static>> {
+    let mut lines = vec![
         format!(" task: {}", single_line(&task.name)),
         format!(
             " status: {} · agent: {}",
@@ -1020,6 +1143,24 @@ fn task_detail_lines(task: &Task, width: usize) -> Vec<Line<'static>> {
                 .unwrap_or_else(|| "none".to_string())
         ),
     ];
+    if let Ok(Some(plan)) = store.latest_plan(&task.id)
+        && let Ok(items) = store.work_items(&task.id, plan.version)
+    {
+        lines.truncate(1);
+        lines.push(format!(
+            " plan v{}: {}",
+            plan.version,
+            single_line(&plan.summary)
+        ));
+        for item in items.into_iter().take(4) {
+            lines.push(format!(
+                " {:<12} {:<10} {}",
+                item.step.id,
+                format!("{:?}", item.state).to_ascii_lowercase(),
+                single_line(&item.step.title)
+            ));
+        }
+    }
     lines
         .into_iter()
         .enumerate()
@@ -1032,6 +1173,66 @@ fn task_detail_lines(task: &Task, width: usize) -> Vec<Line<'static>> {
             Line::from(Span::styled(fit_cells(&line, width), style))
         })
         .collect()
+}
+
+fn render_plan_detail(frame: &mut Frame, store: &Store, task: &Task) {
+    let area = centered_rect(
+        frame.area(),
+        frame.area().width.saturating_mul(4) / 5,
+        frame.area().height.saturating_mul(4) / 5,
+    );
+    frame.render_widget(ClearWidget, area);
+    let mut lines = vec![Line::from(Span::styled(
+        single_line(&task.name),
+        Style::default().add_modifier(Modifier::BOLD),
+    ))];
+    match store.latest_plan(&task.id) {
+        Ok(Some(plan)) => {
+            lines.push(Line::from(format!(
+                "plan v{} · {}",
+                plan.version, plan.summary
+            )));
+            let items = store.work_items(&task.id, plan.version).unwrap_or_default();
+            for step in &plan.steps {
+                let item = items.iter().find(|item| item.step.id == step.id);
+                lines.push(Line::from(""));
+                lines.push(Line::from(format!(
+                    "{} · {} · {:?}/{:?} · {}",
+                    step.id,
+                    item.map(|item| format!("{:?}", item.state).to_ascii_lowercase())
+                        .unwrap_or_else(|| "missing".to_string()),
+                    step.risk,
+                    step.mode,
+                    step.profile
+                )));
+                lines.push(Line::from(format!("  {}", step.objective)));
+                lines.push(Line::from(format!(
+                    "  deps: {} · branch: {} · attempt: {}",
+                    if step.depends_on.is_empty() {
+                        "-".to_string()
+                    } else {
+                        step.depends_on.join(",")
+                    },
+                    item.and_then(|item| item.branch.as_deref()).unwrap_or("-"),
+                    item.map(|item| item.attempt).unwrap_or(0)
+                )));
+                if let Some(summary) = item.and_then(|item| item.summary.as_deref()) {
+                    lines.push(Line::from(format!("  {}", single_line(summary))));
+                }
+            }
+        }
+        Ok(None) => lines.push(Line::from("no orchestration plan")),
+        Err(error) => lines.push(Line::from(error.to_string())),
+    }
+    frame.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title(" orchestration · enter close "),
+        ),
+        area,
+    );
 }
 
 fn compact_identifier(value: Option<&str>) -> String {
@@ -1196,13 +1397,15 @@ mod tests {
             menu.action_at(2, 4),
             Some(MenuAction::Move(TaskStatus::Backlog))
         ));
-        assert!(matches!(menu.action_at(2, 10), Some(MenuAction::Refresh)));
-        assert!(matches!(menu.action_at(2, 12), Some(MenuAction::Close)));
+        assert!(matches!(menu.action_at(2, 12), Some(MenuAction::Refresh)));
+        assert!(matches!(menu.action_at(2, 13), Some(MenuAction::Close)));
         assert!(menu.action_at(1, 4).is_none());
     }
 
     #[test]
     fn compact_render_uses_bounded_terminal_cells() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path().join("state.db")).unwrap();
         let backend = TestBackend::new(36, 14);
         let mut terminal = Terminal::new(backend).expect("test terminal");
         let tasks = vec![Task {
@@ -1212,7 +1415,20 @@ mod tests {
             ..Task::default()
         }];
         terminal
-            .draw(|frame| render_board(frame, &tasks, 0, None, None, None))
+            .draw(|frame| {
+                render_board(
+                    frame,
+                    &BoardView {
+                        store: &store,
+                        tasks: &tasks,
+                        selected: 0,
+                        message: None,
+                        menu: None,
+                        new_task: None,
+                        detail_open: false,
+                    },
+                )
+            })
             .expect("render board");
         let buffer = terminal.backend().buffer();
         let rendered = buffer

@@ -385,6 +385,8 @@ impl NotionProvider {
             path: default_path,
             default_agent: "codex".to_string(),
             active: true,
+            checks: Vec::new(),
+            check_timeout_seconds: 900,
         });
         Ok(InitializationResult {
             tasks_database_id: tasks_database.id,

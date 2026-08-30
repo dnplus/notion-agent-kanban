@@ -378,6 +378,13 @@ mod tests {
             runtime_id: Some(serde_json::to_string(&runtime()).unwrap()),
             attempt: 1,
             retry_at: None,
+            role: Default::default(),
+            parent_task_id: None,
+            work_item_id: None,
+            plan_version: None,
+            checkout_path: None,
+            branch: None,
+            submission_path: None,
         };
         store.save_execution(&execution).unwrap();
         let context = HerdrContext {
@@ -408,6 +415,13 @@ mod tests {
             runtime_id: Some("{".to_string()),
             attempt: 1,
             retry_at: None,
+            role: Default::default(),
+            parent_task_id: None,
+            work_item_id: None,
+            plan_version: None,
+            checkout_path: None,
+            branch: None,
+            submission_path: None,
         };
         store.save_execution(&execution).unwrap();
         let context = HerdrContext {
@@ -461,6 +475,13 @@ mod tests {
                 runtime_id: Some(serde_json::to_string(&runtime).unwrap()),
                 attempt: 1,
                 retry_at: None,
+                role: Default::default(),
+                parent_task_id: None,
+                work_item_id: None,
+                plan_version: None,
+                checkout_path: None,
+                branch: None,
+                submission_path: None,
             };
             store.save_execution(&execution).unwrap();
         }

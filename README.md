@@ -99,6 +99,10 @@ kbctl board
 kbctl daemon run
 kbctl project bind <project-id-or-default> <directory>
 kbctl task move <task-id> ready
+kbctl plan show <task-id>
+kbctl report submit --execution <execution-id> --manifest plan-or-result.json
+kbctl task retry <task-id> --step <step-id>
+kbctl task finish <task-id>
 kbctl report done --execution <execution-id> --summary "what changed and how it was verified"
 kbctl install --grok
 
@@ -110,6 +114,14 @@ herdr plugin action invoke kbctl.cancel-task
 ```
 
 Config: `~/.config/kbctl/config.toml`. State: `~/.local/share/kbctl/state.db`. Override with `KBCTL_CONFIG` and `KBCTL_STATE`.
+
+## Supervisor orchestration
+
+`triage` tasks use the configured `supervisor` Codex/Sol profile. The Supervisor submits a versioned Plan DAG; kbctl validates profiles, dependencies, risk, write scopes, and the eight-step limit before persisting child work locally. Low-risk steps run automatically. Medium/high-risk steps wait until the Parent is moved to `ready`, which approves only the current plan version.
+
+Worker write steps run in isolated Git worktrees. Accepted commits merge sequentially into `kbctl/<parent>/v<version>` without changing the user's checkout. The configured project checks are the only executable gates. After final Supervisor acceptance, write plans remain in `review` until the integration branch is merged into the originally bound branch and `kbctl task finish <task>` verifies reachability. Read-only plans can complete automatically.
+
+Herdr 0.8.2 or newer is required. Codex, OpenCode, and Grok are profile translations over the same Herdr runtime. Agent state changes trigger event-driven reconciliation, while the 15-second Notion/runtime poll remains the recovery path after disconnects or missed events. A Herdr `done` or `idle` state never completes a task without a valid kbctl envelope.
 
 ```toml
 [daemon]

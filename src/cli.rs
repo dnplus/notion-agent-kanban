@@ -1,14 +1,15 @@
 use crate::{
     config::{Config, LocalProjectBinding},
     daemon::Daemon,
-    domain::{ExecutionMode, Report, TaskStatus},
+    domain::{ExecutionMode, PlanState, Report, SubmissionEnvelope, TaskStatus, WorkItemState},
     error::KbctlError,
+    git_workspace,
     herdr::{AgentRuntime, HerdrRuntime},
     herdr_action,
     herdr_context::HerdrContext,
     install,
     notion::{KanbanProvider, NotionProvider, TaskUpdate},
-    report_spool,
+    orchestration, report_spool,
     store::Store,
     tui,
 };
@@ -48,6 +49,10 @@ enum Command {
     Task {
         #[command(subcommand)]
         command: TaskCommand,
+    },
+    Plan {
+        #[command(subcommand)]
+        command: PlanCommand,
     },
     Report {
         #[command(subcommand)]
@@ -99,7 +104,23 @@ enum ProjectCommand {
 
 #[derive(Debug, Subcommand)]
 enum TaskCommand {
-    Move { task: String, status: TaskStatus },
+    Move {
+        task: String,
+        status: TaskStatus,
+    },
+    Finish {
+        task: String,
+    },
+    Retry {
+        task: String,
+        #[arg(long)]
+        step: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum PlanCommand {
+    Show { task: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -107,6 +128,15 @@ enum ReportCommand {
     Done(ReportArgs),
     Blocked(ReportArgs),
     Review(ReportArgs),
+    Submit(SubmitArgs),
+}
+
+#[derive(Debug, Args)]
+struct SubmitArgs {
+    #[arg(long, env = "KBCTL_EXECUTION_ID")]
+    execution: String,
+    #[arg(long, value_name = "PATH")]
+    manifest: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -164,6 +194,15 @@ pub async fn run() -> Result<()> {
         Command::Task {
             command: TaskCommand::Move { task, status },
         } => move_task(config, task, status).await?,
+        Command::Task {
+            command: TaskCommand::Finish { task },
+        } => finish_task(config, task).await?,
+        Command::Task {
+            command: TaskCommand::Retry { task, step },
+        } => retry_task(task, step)?,
+        Command::Plan {
+            command: PlanCommand::Show { task },
+        } => show_plan(task)?,
         Command::Report { command } => report(config, command).await?,
         Command::Doctor => doctor(config).await?,
         Command::Install(args) => install::run(config, args.grok, args.codex, args.herdr)?,
@@ -227,6 +266,8 @@ fn bind_project(
         path,
         default_agent: agent,
         active: true,
+        checks: Vec::new(),
+        check_timeout_seconds: 900,
     };
     if id == "__implicit__" || project.eq_ignore_ascii_case("default") {
         config.project.default = Some(binding);
@@ -322,10 +363,14 @@ async fn move_task(config: Config, task_id: String, status: TaskStatus) -> Resul
 }
 
 async fn report(config: Config, command: ReportCommand) -> Result<()> {
+    if let ReportCommand::Submit(args) = command {
+        return submit_manifest(config, args).await;
+    }
     let (status, args) = match command {
         ReportCommand::Done(args) => (TaskStatus::Done, args),
         ReportCommand::Blocked(args) => (TaskStatus::Blocked, args),
         ReportCommand::Review(args) => (TaskStatus::Review, args),
+        ReportCommand::Submit(_) => unreachable!(),
     };
     let execution_id = args
         .execution
@@ -407,6 +452,158 @@ async fn report(config: Config, command: ReportCommand) -> Result<()> {
     Ok(())
 }
 
+fn show_plan(task_id: String) -> Result<()> {
+    let task_id = normalize_local_task_id(&task_id)?;
+    let store = Store::open(crate::config::default_state_path())?;
+    let plan = store.latest_plan(&task_id)?.ok_or_else(|| {
+        KbctlError::Validation(format!("task {task_id} has no orchestration plan"))
+    })?;
+    let items = store.work_items(&task_id, plan.version)?;
+    println!(
+        "{} · plan v{} · {}",
+        plan.parent_task_id, plan.version, plan.summary
+    );
+    for step in &plan.steps {
+        let state = items
+            .iter()
+            .find(|item| item.step.id == step.id)
+            .map(|item| format!("{:?}", item.state).to_ascii_lowercase())
+            .unwrap_or_else(|| "missing".to_string());
+        let dependencies = if step.depends_on.is_empty() {
+            "-".to_string()
+        } else {
+            step.depends_on.join(",")
+        };
+        println!(
+            "{}  {}  {:?}/{:?}  profile={}  deps={}  {}",
+            step.id, state, step.risk, step.mode, step.profile, dependencies, step.title
+        );
+    }
+    Ok(())
+}
+
+fn retry_task(task_id: String, step_id: Option<String>) -> Result<()> {
+    let task_id = normalize_local_task_id(&task_id)?;
+    let store = Store::open(crate::config::default_state_path())?;
+    let Some(plan) = store.latest_plan(&task_id)? else {
+        let mut run = store.orchestration_run(&task_id)?.ok_or_else(|| {
+            KbctlError::Validation(format!("task {task_id} has no orchestration run"))
+        })?;
+        run.state = crate::domain::PlanState::Planning;
+        run.supervisor_execution_id = None;
+        run.updated_at = Utc::now();
+        store.save_orchestration_run(&run)?;
+        println!("已將 Supervisor planning run 排回重試");
+        return Ok(());
+    };
+    let mut changed = 0;
+    for mut item in store.work_items(&task_id, plan.version)? {
+        if step_id.as_ref().is_some_and(|id| id != &item.step.id) {
+            continue;
+        }
+        if !matches!(
+            item.state,
+            WorkItemState::Blocked | WorkItemState::Failed | WorkItemState::Rework
+        ) {
+            continue;
+        }
+        item.state = WorkItemState::Pending;
+        item.execution_id = None;
+        item.summary = None;
+        store.save_work_item(&item)?;
+        changed += 1;
+    }
+    if changed == 0 {
+        return Err(KbctlError::Validation("no retryable work item matched".to_string()).into());
+    }
+    println!("已將 {changed} 個 work item 排回 pending");
+    Ok(())
+}
+
+async fn finish_task(config: Config, task_id: String) -> Result<()> {
+    let task_id = normalize_local_task_id(&task_id)?;
+    let store = Store::open(crate::config::default_state_path())?;
+    let run = store.orchestration_run(&task_id)?.ok_or_else(|| {
+        KbctlError::Validation(format!("task {task_id} has no orchestration run"))
+    })?;
+    if run.state != PlanState::AwaitingMerge {
+        return Err(KbctlError::Validation(format!(
+            "task is {:?}, expected awaiting_merge",
+            run.state
+        ))
+        .into());
+    }
+    let provider = NotionProvider::new(config.clone())?;
+    let task = provider.get_task(&task_id).await?;
+    let binding = config
+        .project_binding(task.project_id.as_deref())
+        .ok_or_else(|| KbctlError::Validation("task has no local project binding".to_string()))?;
+    let repository = Path::new(&binding.path);
+    let integration = run.integration_branch.as_deref().ok_or_else(|| {
+        KbctlError::Validation("orchestration run has no integration branch".to_string())
+    })?;
+    let base = run.base_branch.as_deref().ok_or_else(|| {
+        KbctlError::Validation("orchestration run has no bound base branch".to_string())
+    })?;
+    if !git_workspace::is_ancestor(repository, integration, base).await? {
+        return Err(KbctlError::Validation(format!(
+            "integration branch {integration} has not been merged into {base}"
+        ))
+        .into());
+    }
+    git_workspace::run_checks(repository, &binding.checks, binding.check_timeout_seconds).await?;
+    provider
+        .append_result(
+            &task_id,
+            &format!("Integration branch {integration} verified in {base}"),
+        )
+        .await?;
+    provider
+        .update_task(TaskUpdate {
+            id: task_id.clone(),
+            status: Some(TaskStatus::Done),
+            clear_execution_id: true,
+            result: Some(format!(
+                "integration branch {integration} merged into {base}"
+            )),
+            ..Default::default()
+        })
+        .await?;
+    let mut completed_run = run;
+    completed_run.state = PlanState::Done;
+    completed_run.updated_at = Utc::now();
+    store.save_orchestration_run(&completed_run)?;
+    println!("Task 已驗證合併並更新為 done");
+    Ok(())
+}
+
+async fn submit_manifest(config: Config, args: SubmitArgs) -> Result<()> {
+    let encoded = std::fs::read_to_string(&args.manifest).map_err(|error| {
+        KbctlError::Validation(format!(
+            "read manifest {}: {error}",
+            args.manifest.display()
+        ))
+    })?;
+    let envelope: SubmissionEnvelope = serde_json::from_str(&encoded)
+        .map_err(|error| KbctlError::Validation(format!("invalid manifest: {error}")))?;
+    if let Some(path) = report_spool::configured_submission_path() {
+        report_spool::write_submission(
+            &path,
+            &report_spool::AgentSubmission {
+                execution_id: args.execution,
+                envelope,
+            },
+        )?;
+        println!("submission 已寫入本機回報檔，daemon 會處理。");
+        return Ok(());
+    }
+    let store = Store::open(crate::config::default_state_path())?;
+    orchestration::apply_submission(&config, &store, &args.execution, &envelope)?;
+    store.mark_execution_state(&args.execution, "submitted")?;
+    println!("submission 已驗證並保存。");
+    Ok(())
+}
+
 async fn doctor(config: Config) -> Result<()> {
     let provider = match NotionProvider::new(config.clone()) {
         Ok(provider) => provider,
@@ -449,10 +646,51 @@ async fn doctor(config: Config) -> Result<()> {
     }
     let runtime = HerdrRuntime::new(config.herdr.binary);
     match runtime.status().await {
-        Ok(_) => println!("PASS Herdr"),
+        Ok(_) => match runtime.version().await {
+            Ok(version) if herdr_version_supported(&version) => println!("PASS Herdr ({version})"),
+            Ok(version) => println!("FAIL Herdr version: {version}; kbctl requires 0.8.2 or newer"),
+            Err(error) => println!("FAIL Herdr version: {error}"),
+        },
         Err(error) => println!("FAIL Herdr: {error}"),
     }
+    for (name, profile) in &config.profiles {
+        let role_ok = name != &config.orchestration.supervisor_profile
+            || (profile.kind == "codex"
+                && profile.role == crate::domain::ExecutionRole::Supervisor);
+        if !role_ok {
+            println!("FAIL profile {name}: supervisor must be a Codex supervisor profile");
+            continue;
+        }
+        match tokio::process::Command::new(&profile.kind)
+            .arg("--version")
+            .output()
+            .await
+        {
+            Ok(output) if output.status.success() => {
+                println!("PASS profile {name} ({})", profile.kind)
+            }
+            _ => println!("FAIL profile {name}: {} binary unavailable", profile.kind),
+        }
+    }
     Ok(())
+}
+
+fn herdr_version_supported(version: &str) -> bool {
+    let value = version.split_whitespace().find(|part| {
+        part.chars()
+            .next()
+            .is_some_and(|value| value.is_ascii_digit())
+    });
+    let Some(value) = value else {
+        return false;
+    };
+    let mut parts = value.split('.').filter_map(|part| part.parse::<u32>().ok());
+    let current = (
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+    );
+    current >= (0, 8, 2)
 }
 
 fn render_report(report: &Report, result_file: Option<&str>) -> String {
@@ -518,4 +756,23 @@ fn normalize_notion_id(value: &str) -> Result<String, KbctlError> {
     } else {
         Err(KbctlError::Validation("Notion ID 不可為空".to_string()))
     }
+}
+
+fn normalize_local_task_id(value: &str) -> Result<String, KbctlError> {
+    let compact = normalize_notion_id(value)?.replace('-', "");
+    if compact.len() != 32
+        || !compact
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
+    {
+        return Ok(compact);
+    }
+    Ok(format!(
+        "{}-{}-{}-{}-{}",
+        &compact[0..8],
+        &compact[8..12],
+        &compact[12..16],
+        &compact[16..20],
+        &compact[20..32]
+    ))
 }

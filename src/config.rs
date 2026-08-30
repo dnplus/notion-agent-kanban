@@ -1,4 +1,4 @@
-use crate::error::KbctlError;
+use crate::{domain::ExecutionRole, error::KbctlError};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub notion: NotionConfig,
@@ -14,6 +14,24 @@ pub struct Config {
     pub project: ProjectConfig,
     pub daemon: DaemonConfig,
     pub herdr: HerdrConfig,
+    pub orchestration: OrchestrationConfig,
+    pub profiles: BTreeMap<String, AgentProfile>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        let mut config = Self {
+            notion: NotionConfig::default(),
+            mapping: MappingConfig::default(),
+            project: ProjectConfig::default(),
+            daemon: DaemonConfig::default(),
+            herdr: HerdrConfig::default(),
+            orchestration: OrchestrationConfig::default(),
+            profiles: BTreeMap::new(),
+        };
+        config.ensure_default_profiles();
+        config
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -69,6 +87,29 @@ pub struct LocalProjectBinding {
     pub path: String,
     pub default_agent: String,
     pub active: bool,
+    #[serde(default)]
+    pub checks: Vec<String>,
+    #[serde(default = "default_check_timeout_seconds")]
+    pub check_timeout_seconds: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OrchestrationConfig {
+    pub supervisor_profile: String,
+    pub max_steps: usize,
+    pub max_workers_per_plan: usize,
+    pub max_rework: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AgentProfile {
+    pub kind: String,
+    pub model: Option<String>,
+    pub reasoning: Option<String>,
+    pub agent: Option<String>,
+    pub role: ExecutionRole,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -107,6 +148,33 @@ impl Default for HerdrConfig {
     }
 }
 
+impl Default for OrchestrationConfig {
+    fn default() -> Self {
+        Self {
+            supervisor_profile: "supervisor".to_string(),
+            max_steps: 8,
+            max_workers_per_plan: 3,
+            max_rework: 2,
+        }
+    }
+}
+
+impl Default for AgentProfile {
+    fn default() -> Self {
+        Self {
+            kind: "codex".to_string(),
+            model: None,
+            reasoning: None,
+            agent: None,
+            role: ExecutionRole::Worker,
+        }
+    }
+}
+
+fn default_check_timeout_seconds() -> u64 {
+    900
+}
+
 impl Config {
     pub fn load(path: Option<&Path>) -> Result<Self, KbctlError> {
         let path = path.map(PathBuf::from).unwrap_or_else(default_config_path);
@@ -115,8 +183,10 @@ impl Config {
         }
         let contents = fs::read_to_string(&path)
             .map_err(|error| KbctlError::Config(format!("read {}: {error}", path.display())))?;
-        toml::from_str(&contents)
-            .map_err(|error| KbctlError::Config(format!("parse {}: {error}", path.display())))
+        let mut config: Self = toml::from_str(&contents)
+            .map_err(|error| KbctlError::Config(format!("parse {}: {error}", path.display())))?;
+        config.ensure_default_profiles();
+        Ok(config)
     }
 
     pub fn save(&self, path: Option<&Path>) -> Result<PathBuf, KbctlError> {
@@ -170,6 +240,54 @@ impl Config {
         project_id
             .and_then(|id| self.project.bindings.get(id))
             .or(self.project.default.as_ref())
+    }
+
+    pub fn ensure_default_profiles(&mut self) {
+        self.profiles
+            .entry("supervisor".to_string())
+            .or_insert_with(|| AgentProfile {
+                kind: "codex".to_string(),
+                model: Some("gpt-5.6-sol".to_string()),
+                reasoning: Some("high".to_string()),
+                agent: None,
+                role: ExecutionRole::Supervisor,
+            });
+        self.profiles
+            .entry("fast_worker".to_string())
+            .or_insert_with(|| AgentProfile {
+                kind: "codex".to_string(),
+                model: Some("gpt-5.6-luna".to_string()),
+                reasoning: Some("high".to_string()),
+                agent: None,
+                role: ExecutionRole::Worker,
+            });
+        self.profiles
+            .entry("opencode_worker".to_string())
+            .or_insert_with(|| AgentProfile {
+                kind: "opencode".to_string(),
+                model: None,
+                reasoning: None,
+                agent: Some("build".to_string()),
+                role: ExecutionRole::Worker,
+            });
+        self.profiles
+            .entry("grok_worker".to_string())
+            .or_insert_with(|| AgentProfile {
+                kind: "grok".to_string(),
+                model: None,
+                reasoning: None,
+                agent: None,
+                role: ExecutionRole::Worker,
+            });
+    }
+
+    pub fn profile(&self, name: &str) -> Option<AgentProfile> {
+        self.profiles.get(name).cloned().or_else(|| {
+            matches!(name, "codex" | "opencode" | "grok").then(|| AgentProfile {
+                kind: name.to_string(),
+                ..AgentProfile::default()
+            })
+        })
     }
 }
 

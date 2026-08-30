@@ -124,7 +124,7 @@ fn herdr_plugin_path(config: &Config) -> PathBuf {
 fn herdr_manifest(executable: &Path) -> String {
     let executable = toml_string(&executable.display().to_string());
     format!(
-        "id = \"kbctl\"\nname = \"kbctl\"\nversion = \"{}\"\nmin_herdr_version = \"0.8.0\"\ndescription = \"Context-aware Notion task control for Herdr\"\nplatforms = [\"macos\", \"linux\", \"windows\"]\n\n[[panes]]\nid = \"board\"\ntitle = \"kbctl board\"\nplacement = \"split\"\ncommand = [{executable} , \"board\"]\n\n[[actions]]\nid = \"open-board\"\ntitle = \"Open kbctl board\"\ndescription = \"Open the board and select the task associated with the focused Herdr pane.\"\ncontexts = [\"global\", \"workspace\", \"tab\", \"pane\"]\ncommand = [{executable} , \"_herdr-open-board\"]\n\n[[actions]]\nid = \"task-detail\"\ntitle = \"Open current task\"\ndescription = \"Open the focused pane's kbctl task in the board.\"\ncontexts = [\"workspace\", \"tab\", \"pane\"]\ncommand = [{executable} , \"_herdr-task-detail\"]\n\n[[actions]]\nid = \"focus-task\"\ntitle = \"Focus current task\"\ndescription = \"Focus the Herdr agent for the focused pane's kbctl task.\"\ncontexts = [\"pane\"]\ncommand = [{executable} , \"_herdr-focus-task\"]\n\n[[actions]]\nid = \"cancel-task\"\ntitle = \"Cancel current task\"\ndescription = \"Cancel the kbctl task associated with the focused Herdr pane.\"\ncontexts = [\"pane\"]\ncommand = [{executable} , \"_herdr-cancel-task\"]\n",
+        "id = \"kbctl\"\nname = \"kbctl\"\nversion = \"{}\"\nmin_herdr_version = \"0.8.2\"\ndescription = \"Context-aware Notion task control for Herdr\"\nplatforms = [\"macos\", \"linux\", \"windows\"]\n\n[[panes]]\nid = \"board\"\ntitle = \"kbctl board\"\nplacement = \"split\"\ncommand = [{executable} , \"board\"]\n\n[[actions]]\nid = \"open-board\"\ntitle = \"Open kbctl board\"\ndescription = \"Open the board and select the task associated with the focused Herdr pane.\"\ncontexts = [\"global\", \"workspace\", \"tab\", \"pane\"]\ncommand = [{executable} , \"_herdr-open-board\"]\n\n[[actions]]\nid = \"task-detail\"\ntitle = \"Open current task\"\ndescription = \"Open the focused pane's kbctl task in the board.\"\ncontexts = [\"workspace\", \"tab\", \"pane\"]\ncommand = [{executable} , \"_herdr-task-detail\"]\n\n[[actions]]\nid = \"focus-task\"\ntitle = \"Focus current task\"\ndescription = \"Focus the Herdr agent for the focused pane's kbctl task.\"\ncontexts = [\"pane\"]\ncommand = [{executable} , \"_herdr-focus-task\"]\n\n[[actions]]\nid = \"cancel-task\"\ntitle = \"Cancel current task\"\ndescription = \"Cancel the kbctl task associated with the focused Herdr pane.\"\ncontexts = [\"pane\"]\ncommand = [{executable} , \"_herdr-cancel-task\"]\n",
         env!("CARGO_PKG_VERSION")
     )
 }
@@ -157,12 +157,16 @@ fn home_dir() -> PathBuf {
 
 const REPORT_SKILL: &str = r#"---
 name: kbctl-report
-description: Report a kbctl task result after completing a work contract. Use when KBCTL_EXECUTION_ID is set, a kbctl work contract is present, or the user asks to kbctl report done, review, or blocked.
+description: Submit a kbctl work contract result. Use when KBCTL_EXECUTION_ID is set or a kbctl Supervisor, Worker, or standalone contract is present.
 ---
 
 # kbctl report
 
 Keep `KBCTL_EXECUTION_ID` and `KBCTL_TASK_ID` from the environment. kbctl validates the report and writes business status back to Notion.
+
+When `KBCTL_EXECUTION_ROLE` is `supervisor`, `reviewer`, or `worker`, write the JSON envelope required by the work contract and run `kbctl report submit --execution "$KBCTL_EXECUTION_ID" --manifest <file>`. Supervisors submit Plan and Review envelopes. Workers submit Completion envelopes and must commit write work before submission.
+
+For standalone contracts:
 
 - Success: `kbctl report done --summary "what changed and how it was verified"`
 - Human review: `kbctl report review --summary "what needs review"`
