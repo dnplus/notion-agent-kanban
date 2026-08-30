@@ -77,6 +77,7 @@ struct ContextMenu {
 enum MenuAction {
     Move(TaskStatus),
     Focus,
+    OpenNotion,
     Retry,
     Diff,
     Refresh,
@@ -84,13 +85,14 @@ enum MenuAction {
 }
 
 impl ContextMenu {
-    const ITEMS: [(MenuAction, &'static str); 10] = [
+    const ITEMS: [(MenuAction, &'static str); 11] = [
         (MenuAction::Move(TaskStatus::Backlog), "1 backlog"),
         (MenuAction::Move(TaskStatus::Triage), "2 triage"),
         (MenuAction::Move(TaskStatus::Scheduled), "3 scheduled"),
         (MenuAction::Move(TaskStatus::Ready), "4 ready"),
         (MenuAction::Move(TaskStatus::Cancel), "c cancel"),
         (MenuAction::Focus, "f focus"),
+        (MenuAction::OpenNotion, "o open in Notion"),
         (MenuAction::Retry, "t retry"),
         (MenuAction::Diff, "d integration diff"),
         (MenuAction::Refresh, "r refresh"),
@@ -537,6 +539,10 @@ async fn board_loop(
                             menu = None;
                             *message = focus_selected(store, runtime, tasks, selected).await;
                         }
+                        KeyCode::Char('o') => {
+                            menu = None;
+                            *message = open_notion_selected(tasks, selected).await;
+                        }
                         KeyCode::Char('t') => {
                             menu = None;
                             *message = retry_selected(store, tasks, selected);
@@ -581,6 +587,12 @@ async fn board_loop(
                                         active_menu.task_index.min(tasks.len().saturating_sub(1));
                                     *message =
                                         focus_selected(store, runtime, tasks, selected).await;
+                                }
+                                Some(MenuAction::OpenNotion) => {
+                                    menu = None;
+                                    selected =
+                                        active_menu.task_index.min(tasks.len().saturating_sub(1));
+                                    *message = open_notion_selected(tasks, selected).await;
                                 }
                                 Some(MenuAction::Retry) => {
                                     menu = None;
@@ -833,6 +845,38 @@ async fn focus_selected(
     }
 }
 
+async fn open_notion_selected(tasks: &[Task], selected: usize) -> Option<String> {
+    let Some(task) = tasks.get(selected) else {
+        return Some("no task selected".to_string());
+    };
+    let url = notion_task_url(&task.id);
+    let result = if cfg!(target_os = "macos") {
+        tokio::process::Command::new("open")
+            .arg(&url)
+            .status()
+            .await
+    } else if cfg!(target_os = "windows") {
+        tokio::process::Command::new("cmd")
+            .args(["/C", "start", "", &url])
+            .status()
+            .await
+    } else {
+        tokio::process::Command::new("xdg-open")
+            .arg(&url)
+            .status()
+            .await
+    };
+    match result {
+        Ok(status) if status.success() => Some("opened task in Notion".to_string()),
+        Ok(status) => Some(format!("open Notion failed with {status}")),
+        Err(error) => Some(format!("open Notion failed: {error}")),
+    }
+}
+
+fn notion_task_url(task_id: &str) -> String {
+    format!("https://www.notion.so/{}", task_id.replace('-', ""))
+}
+
 fn retry_selected(store: &Store, tasks: &[Task], selected: usize) -> Option<String> {
     let task = tasks.get(selected)?;
     let mut run = match store.orchestration_run(&task.id) {
@@ -978,9 +1022,9 @@ fn render_board(frame: &mut Frame, view: &BoardView<'_>) {
     } else if area.width < 72 {
         "↑↓ select · n new · 1-4 · c · f · m · q"
     } else if compact {
-        "↑↓ select · n new · 1-4 move · c cancel · f focus · m menu · q quit"
+        "↑↓ select · n new · 1-4 move · c cancel · f focus · o Notion · m menu · q quit"
     } else {
-        "↑/↓ select · n new · 1-4 move · c cancel · f focus · m menu · q quit"
+        "↑/↓ select · n new · 1-4 move · c cancel · f focus · o Notion · m menu · q quit"
     };
     frame.render_widget(
         Paragraph::new(fit_cells(keys, area.width as usize))
@@ -1397,9 +1441,17 @@ mod tests {
             menu.action_at(2, 4),
             Some(MenuAction::Move(TaskStatus::Backlog))
         ));
-        assert!(matches!(menu.action_at(2, 12), Some(MenuAction::Refresh)));
-        assert!(matches!(menu.action_at(2, 13), Some(MenuAction::Close)));
+        assert!(matches!(menu.action_at(2, 13), Some(MenuAction::Refresh)));
+        assert!(matches!(menu.action_at(2, 14), Some(MenuAction::Close)));
         assert!(menu.action_at(1, 4).is_none());
+    }
+
+    #[test]
+    fn notion_task_url_uses_the_canonical_page_id() {
+        assert_eq!(
+            notion_task_url("3cb3be72-97e2-819d-98ea-e31c5d55b16e"),
+            "https://www.notion.so/3cb3be7297e2819d98eae31c5d55b16e"
+        );
     }
 
     #[test]
